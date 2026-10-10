@@ -1,4 +1,4 @@
-'use client';
+﻿'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
 import Header from '@/components/Header';
@@ -36,14 +36,15 @@ export default function Dashboard() {
   const [isAnalysisOpen, setIsAnalysisOpen] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [lang, setLang] = useState<'th' | 'en'>('th');
-  const [myDevice, setMyDevice] = useState<string>('—');
+  const [myDevice, setMyDevice] = useState<string>('â€”');
   const [supaStatus, setSupaStatus] = useState(false);
+  const [realtimeStatus, setRealtimeStatus] = useState<string>('CONNECTING...');
   const [traccarStatus, setTraccarStatus] = useState(false);
 
   // Analysis States
   const [refLat, setRefLat] = useState('');
   const [refLng, setRefLng] = useState('');
-  const [refStatus, setRefStatus] = useState('ไม่ได้ตั้งค่า');
+  const [refStatus, setRefStatus] = useState('à¹„à¸¡à¹ˆà¹„à¸”à¹‰à¸•à¸±à¹‰à¸‡à¸„à¹ˆà¸²');
   const defaultStats = { samples: '-', meanError: '-', stdDev: '-', min: '-', max: '-', avgAcc: '-', barWidth: 0 };
   const [browserStats, setBrowserStats] = useState<any>(defaultStats);
   const [iotStats, setIotStats] = useState<any>(defaultStats);
@@ -53,16 +54,17 @@ export default function Dashboard() {
   const { livePos, setLivePos } = useLivePositions();
   const { histArr, setHistArr } = useHistory();
   const { filter, setFilter, isTrack, setIsTrack, gpsOn, setGpsOn } = useTrackingSettings();
+  const [browserInterval, setBrowserInterval] = useState<number>(2);
 
   // Connection hooks
-  const { startGPS, stopGPS, position: gpsPosition, gpsOn: browserGpsActive, error: gpsError } = useBrowserGPS();
+  const { startGPS, stopGPS, position: gpsPosition, gpsOn: browserGpsActive, error: gpsError } = useBrowserGPS(browserInterval);
   const { connect: connectTraccar, disconnect: disconnectTraccar, positions: traccarPositions, isConnected: traccarConnected } = useTraccar();
 
   const [supabase, setSupabase] = useState<any>(null);
 
   useEffect(() => {
     if (gpsError) {
-      alert(`⚠️ Browser GPS Error:\n${gpsError}\n\nPlease check your browser's location permissions or Windows location settings.`);
+      alert(`âš ï¸ Browser GPS Error:\n${gpsError}\n\nPlease check your browser's location permissions or Windows location settings.`);
     }
   }, [gpsError]);
 
@@ -115,12 +117,12 @@ export default function Dashboard() {
             const r = payload.new;
             setLivePos(prev => ({ ...prev, [r.device_id]: r }));
           }
-        }).subscribe();
+        }).subscribe((status) => setRealtimeStatus(status));
         
       client.channel('hist-log')
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'gps_history' }, (payload: any) => {
           setHistArr(prev => { if(prev.some(p => p.id === payload.new.id)) return prev; return [payload.new, ...prev].slice(0, 300); });
-        }).subscribe();
+        }).subscribe((status) => setRealtimeStatus(status));
         
     } catch (err) {
       console.error(err);
@@ -138,6 +140,14 @@ export default function Dashboard() {
     setIsConfigOpen(false);
     initializeSupabase(config.supabaseUrl, config.supabaseKey);
     if (config.traccarToken) connectTraccar(config.traccarToken);
+  };
+
+  const handleChangeDeviceName = () => {
+    const newName = window.prompt('กรุณาระบุชื่อ Device ใหม่:', myDevice);
+    if (newName && newName.trim() !== '') {
+      localStorage.setItem('omni_device_name', newName.trim());
+      setMyDevice(newName.trim());
+    }
   };
 
   // Sync GPS to Supabase
@@ -167,7 +177,7 @@ export default function Dashboard() {
   };
   
   const handleClear = async () => {
-    if (!supabase || !confirm('⚠️ ลบประวัติเส้นทางทั้งหมด?')) return;
+    if (!supabase || !confirm('âš ï¸ à¸¥à¸šà¸›à¸£à¸°à¸§à¸±à¸•à¸´à¹€à¸ªà¹‰à¸™à¸—à¸²à¸‡à¸—à¸±à¹‰à¸‡à¸«à¸¡à¸”?')) return;
     await supabase.from('gps_history').delete().neq('id', '00000000-0000-0000-0000-000000000000');
     await supabase.from('gps_positions').delete().neq('id', '00000000-0000-0000-0000-000000000000');
     setLivePos({});
@@ -179,9 +189,9 @@ export default function Dashboard() {
     if (gpsPosition) {
       setRefLat(gpsPosition.latitude.toFixed(6));
       setRefLng(gpsPosition.longitude.toFixed(6));
-      setRefStatus('✓ ดึงพิกัด GPS สำเร็จ');
+      setRefStatus('âœ“ à¸”à¸¶à¸‡à¸žà¸´à¸à¸±à¸” GPS à¸ªà¸³à¹€à¸£à¹‡à¸ˆ');
     } else {
-      setRefStatus('❌ ไม่พบพิกัด GPS (เปิด Browser GPS ก่อน)');
+      setRefStatus('âŒ à¹„à¸¡à¹ˆà¸žà¸šà¸žà¸´à¸à¸±à¸” GPS (à¹€à¸›à¸´à¸” Browser GPS à¸à¹ˆà¸­à¸™)');
     }
   };
 
@@ -189,7 +199,7 @@ export default function Dashboard() {
     const lat = parseFloat(refLat);
     const lng = parseFloat(refLng);
     if (isNaN(lat) || isNaN(lng)) {
-      setRefStatus('❌ พิกัดอ้างอิงไม่ถูกต้อง');
+      setRefStatus('âŒ à¸žà¸´à¸à¸±à¸”à¸­à¹‰à¸²à¸‡à¸­à¸´à¸‡à¹„à¸¡à¹ˆà¸–à¸¹à¸à¸•à¹‰à¸­à¸‡');
       return;
     }
 
@@ -238,12 +248,12 @@ export default function Dashboard() {
     setBrowserStats(bs);
     setTraccarStats(ts);
     setIotStats(is);
-    setRefStatus(`✓ คำนวณสำเร็จจาก ${histArr.length} จุด`);
+    setRefStatus(`âœ“ à¸„à¸³à¸™à¸§à¸“à¸ªà¸³à¹€à¸£à¹‡à¸ˆà¸ˆà¸²à¸ ${histArr.length} à¸ˆà¸¸à¸”`);
   };
 
   const handleExportCSV = () => {
     if (histArr.length === 0) {
-      alert("ไม่มีข้อมูล History สำหรับ Export");
+      alert("à¹„à¸¡à¹ˆà¸¡à¸µà¸‚à¹‰à¸­à¸¡à¸¹à¸¥ History à¸ªà¸³à¸«à¸£à¸±à¸š Export");
       return;
     }
     const headers = "id,device_id,source,latitude,longitude,speed,accuracy,recorded_at\n";
@@ -255,14 +265,14 @@ export default function Dashboard() {
     const url = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `omni_history_${new Date().getTime()}.csv`;
+    a.download = `tracker_by_boss_history_${new Date().getTime()}.csv`;
     a.click();
   };
 
   const handleResetAnalysis = () => {
     setRefLat('');
     setRefLng('');
-    setRefStatus('ไม่ได้ตั้งค่า');
+    setRefStatus('à¹„à¸¡à¹ˆà¹„à¸”à¹‰à¸•à¸±à¹‰à¸‡à¸„à¹ˆà¸²');
     setBrowserStats(defaultStats);
     setTraccarStats(defaultStats);
     setIotStats(defaultStats);
@@ -291,6 +301,7 @@ export default function Dashboard() {
         onToggleTheme={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
         onToggleLang={() => setLang(l => l === 'th' ? 'en' : 'th')}
         status={{ supabase: supaStatus, gps: browserGpsActive, traccar: traccarConnected }}
+        onChangeDeviceName={handleChangeDeviceName}
       />
       
       <ControlBar 
@@ -298,6 +309,8 @@ export default function Dashboard() {
         gpsOn={browserGpsActive}
         onToggleTracking={toggleTracking}
         onToggleBrowserGPS={toggleBrowserGPS}
+        browserInterval={browserInterval}
+        onBrowserIntervalChange={setBrowserInterval}
         onFilterChange={(src, dev) => setFilter({ src, dev })}
         currentSrc={filter.src}
         currentDev={filter.dev}
@@ -333,5 +346,8 @@ export default function Dashboard() {
     </div>
   );
 }
+
+
+
 
 

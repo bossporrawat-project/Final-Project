@@ -14,7 +14,7 @@ const prompt = Prompt({
 });
 
 export const metadata: Metadata = {
-  title: "Omni Track",
+  title: "Tracker by boss",
   description: "Precision Meets Clarity",
 };
 

@@ -1,4 +1,4 @@
-import React from 'react';
+﻿import React from 'react';
 import { Moon, Sun, Globe, Crosshair, Smartphone } from 'lucide-react';
 
 interface HeaderProps {
@@ -12,6 +12,7 @@ interface HeaderProps {
     gps: boolean;
     traccar: boolean;
   };
+  onChangeDeviceName?: () => void;
 }
 
 export default function Header({
@@ -21,17 +22,22 @@ export default function Header({
   onToggleTheme,
   onToggleLang,
   status,
+  onChangeDeviceName,
 }: HeaderProps) {
   return (
     <header id="hdr">
       <div className="hdr-l">
         <div className="logo">
           <Crosshair size={24} className="logo-icon" strokeWidth={2} />
-          <span>Omni Track</span>
+          <span>Tracker by boss</span>
         </div>
-        <div className="dev-badge">
+        <div 
+          className="dev-badge" style={{ cursor: "pointer", transition: "0.2s" }} onMouseOver={(e) => e.currentTarget.style.opacity = "0.7"} onMouseOut={(e) => e.currentTarget.style.opacity = "1"} 
+          onClick={onChangeDeviceName}
+          title="Click to change device name"
+        >
           <Smartphone size={16} strokeWidth={1.5} className="text-[#06B6D4]" />
-          <span>Device:</span> <b id="my-dev">{deviceName || '—'}</b>
+          <span>Device:</span> <b id="my-dev">{deviceName || 'â€”'}</b>
         </div>
       </div>
       <div className="hdr-r">
@@ -71,3 +77,4 @@ export default function Header({
     </header>
   );
 }
+

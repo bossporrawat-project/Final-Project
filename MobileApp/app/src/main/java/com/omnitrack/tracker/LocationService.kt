@@ -68,7 +68,7 @@ class LocationService : Service() {
     private fun acquireWakeLock() {
         if (wakeLock == null) {
             val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OmniTracker::LocationWakeLock")
+            wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TrackerByBoss::LocationWakeLock")
             wakeLock?.acquire()
         }
     }
@@ -104,7 +104,7 @@ class LocationService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val serviceChannel = NotificationChannel(
                 CHANNEL_ID,
-                "Omni Tracker Background Service",
+                "Tracker by boss Background Service",
                 NotificationManager.IMPORTANCE_LOW
             )
             val manager = getSystemService(NotificationManager::class.java)
@@ -120,7 +120,7 @@ class LocationService : Service() {
         )
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Omni Tracker (Native)")
+            .setContentTitle("Tracker by boss (Native)")
             .setContentText("Tracking every ${gpsInterval}s, Syncing every ${syncInterval}s")
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setContentIntent(pendingIntent)

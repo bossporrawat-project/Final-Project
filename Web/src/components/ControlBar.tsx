@@ -13,6 +13,8 @@ interface ControlBarProps {
   onClear: () => void;
   onToggleAnalysis: () => void;
   deviceOptions: string[];
+  browserInterval: number;
+  onBrowserIntervalChange: (val: number) => void;
 }
 
 export default function ControlBar({
@@ -27,6 +29,8 @@ export default function ControlBar({
   onClear,
   onToggleAnalysis,
   deviceOptions,
+  browserInterval,
+  onBrowserIntervalChange,
 }: ControlBarProps) {
   return (
     <div id="cbar">
@@ -38,14 +42,26 @@ export default function ControlBar({
         {isTracking ? 'Stop' : 'Start'}
       </button>
       
-      <button 
-        className="btn" 
-        onClick={onToggleBrowserGPS}
-        style={{ borderColor: gpsOn ? 'var(--cyan)' : '', color: gpsOn ? 'var(--cyan)' : '' }}
-      >
-        <Navigation size={16} />
-        {gpsOn ? 'GPS: ON' : 'GPS: OFF'}
-      </button>
+      <div className="flex items-center gap-1 bg-[var(--bg-card)] border border-[var(--border)] rounded-[var(--rs)] px-2">
+        <button 
+          className="btn !bg-transparent !border-none !px-1" 
+          onClick={onToggleBrowserGPS}
+          style={{ color: gpsOn ? 'var(--cyan)' : '' }}
+        >
+          <Navigation size={16} />
+          {gpsOn ? 'GPS: ON' : 'GPS: OFF'}
+        </button>
+        <span className="text-[var(--text-3)] text-xs">|</span>
+        <input 
+          type="number" 
+          className="bg-transparent text-[var(--text-1)] text-xs w-12 text-center outline-none" 
+          value={browserInterval}
+          onChange={(e) => onBrowserIntervalChange(Number(e.target.value))}
+          min={1}
+          title="GPS Sync Interval (Seconds)"
+        />
+        <span className="text-[var(--text-3)] text-xs pr-1">sec</span>
+      </div>
       
       <div className="sep"></div>
       

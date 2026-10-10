@@ -12,7 +12,7 @@
 
     <application
         android:allowBackup="true"
-        android:label="Omni Tracker"
+        android:label="Tracker by boss"
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.Light.DarkActionBar">
         
