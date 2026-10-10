@@ -1,0 +1,10 @@
+R_DEF: Internal format may change without notice
+local
+id btnStartTracking
+id btnStopTracking
+id etDeviceName
+id etGpsInterval
+id etSyncInterval
+id tvDbStatus
+id tvGpsStatus
+layout activity_main
