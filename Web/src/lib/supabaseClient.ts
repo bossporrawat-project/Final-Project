@@ -1,12 +1,21 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
-// We can store a singleton instance if needed, or just export a factory
 let supabaseInstance: SupabaseClient | null = null;
+let currentClientKey: string = '';
+
+export const clearSupabaseClient = () => {
+  if (supabaseInstance) {
+    try {
+      supabaseInstance.removeAllChannels();
+    } catch (e) {
+      console.warn('Error clearing Supabase channels:', e);
+    }
+  }
+  supabaseInstance = null;
+  currentClientKey = '';
+};
 
 export const getSupabaseClient = (url?: string, key?: string): SupabaseClient => {
-  if (supabaseInstance && !url && !key) return supabaseInstance;
-
-  // Try to use environment variables as fallback if not provided
   const supabaseUrl = url || process.env.NEXT_PUBLIC_SUPABASE_URL || '';
   const supabaseKey = key || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
@@ -14,10 +23,17 @@ export const getSupabaseClient = (url?: string, key?: string): SupabaseClient =>
     throw new Error('Supabase URL and Key are required to initialize the client.');
   }
 
-  supabaseInstance = createClient(supabaseUrl, supabaseKey);
-  return supabaseInstance;
-};
+  const clientKey = `${supabaseUrl}::${supabaseKey}`;
 
-export const clearSupabaseClient = () => {
-  supabaseInstance = null;
+  // Return existing instance if credentials haven't changed
+  if (supabaseInstance && currentClientKey === clientKey) {
+    return supabaseInstance;
+  }
+
+  // Clean up previous client before creating a new one to prevent channel leaks
+  clearSupabaseClient();
+
+  supabaseInstance = createClient(supabaseUrl, supabaseKey);
+  currentClientKey = clientKey;
+  return supabaseInstance;
 };

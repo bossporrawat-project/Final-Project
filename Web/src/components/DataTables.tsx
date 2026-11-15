@@ -13,6 +13,8 @@ export interface PositionData {
   timestamp?: string;
   updated_at?: string;
   recorded_at?: string;
+  device_time?: string;
+  server_time?: string;
   isMe?: boolean;
 }
 
@@ -40,10 +42,33 @@ export default function DataTables({ liveData, historyData }: DataTablesProps) {
     </div>
   );
 
+  const formatDateTH = (raw?: string) => {
+    if (!raw) return '—';
+    try {
+      const d = new Date(raw);
+      if (isNaN(d.getTime())) return '—';
+      return d.toLocaleDateString('en-GB', { timeZone: 'Asia/Bangkok', day: '2-digit', month: '2-digit', year: 'numeric' });
+    } catch {
+      return '—';
+    }
+  };
+
+  const formatTimeTH = (raw?: string) => {
+    if (!raw) return '—';
+    try {
+      const d = new Date(raw);
+      if (isNaN(d.getTime())) return raw;
+      return d.toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour12: false });
+    } catch {
+      return raw;
+    }
+  };
+
   const renderColumn = (source: string, title: string, headerClass: string) => {
-    // We only display the latest live data for that source in the card
+    // Prefer a device with active non-zero coordinates, falling back to the first entry
     const sourceData = liveData.filter(d => d.source === source);
-    const latest = sourceData.length > 0 ? sourceData[0] : null;
+    const latest = sourceData.find(d => d.latitude !== 0 && d.longitude !== 0) || sourceData[0] || null;
+    const rawTime = latest ? (latest.device_time || latest.timestamp || latest.updated_at || latest.recorded_at || '') : '';
 
     return (
       <div className="comp-col">
@@ -55,20 +80,13 @@ export default function DataTables({ liveData, historyData }: DataTablesProps) {
           {latest ? (
             <>
               {renderDataRow('Device', latest.device_id)}
-              {latest.app_status && renderDataRow('Status', latest.app_status, true)}
-              {latest.latitude !== 0 && renderDataRow('Latitude', latest.latitude.toFixed(6))}
-              {latest.longitude !== 0 && renderDataRow('Longitude', latest.longitude.toFixed(6))}
-              {latest.speed > 0 && renderDataRow('Speed (km/h)', (latest.speed || 0).toFixed(1))}
-              {latest.accuracy !== null && renderDataRow('Accuracy', latest.accuracy ? `${latest.accuracy.toFixed(1)} m` : '—')}
-              {renderDataRow('Time', (() => {
-                const timeStr = latest.timestamp || latest.updated_at || latest.recorded_at || '';
-                if (!timeStr) return '—';
-                try {
-                  const d = new Date(timeStr);
-                  if (isNaN(d.getTime())) return timeStr;
-                  return d.toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour12: false });
-                } catch(e) { return timeStr; }
-              })())}
+              {renderDataRow('Status', latest.app_status || 'Tracking Active', true)}
+              {renderDataRow('Latitude', latest.latitude ? latest.latitude.toFixed(6) : '—')}
+              {renderDataRow('Longitude', latest.longitude ? latest.longitude.toFixed(6) : '—')}
+              {renderDataRow('Speed (km/h)', Number(latest.speed || 0).toFixed(1))}
+              {renderDataRow('Accuracy', latest.accuracy != null ? `${Number(latest.accuracy).toFixed(1)} m` : '—')}
+              {renderDataRow('Date', formatDateTH(rawTime))}
+              {renderDataRow('Time', formatTimeTH(rawTime))}
             </>
           ) : (
             <div className="p-8 text-center text-[var(--text-3)] text-sm flex flex-col items-center gap-2">
@@ -91,7 +109,7 @@ export default function DataTables({ liveData, historyData }: DataTablesProps) {
           </span>
         </div>
         <div className="comp-grid mt-4" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
-          {renderColumn('native', 'Native (Android)', 'ch-browser')}
+          {renderColumn('native', 'Native (Android)', 'ch-native')}
           {renderColumn('browser', 'Browser (Real-time)', 'ch-browser')}
           {renderColumn('traccar', 'Traccar (Deep Analytics)', 'ch-traccar')}
           {renderColumn('iot', 'IoT ESP32 (Stable)', 'ch-iot')}
@@ -112,44 +130,40 @@ export default function DataTables({ liveData, historyData }: DataTablesProps) {
                   <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Lat / Lng</th>
                   <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Speed</th>
                   <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Accuracy</th>
+                  <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Date</th>
                   <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Time</th>
                 </tr>
               </thead>
               <tbody>
                 {historyData.length === 0 ? (
                   <tr>
-                    <td colSpan={6} className="p-8 text-center text-[var(--text-3)]">No history records yet.</td>
+                    <td colSpan={7} className="p-8 text-center text-[var(--text-3)]">No history records yet.</td>
                   </tr>
                 ) : (
-                  historyData.map((row) => (
-                    <tr key={row.id} className="border-b border-[var(--row-alt)] hover:bg-[var(--bg-card-hover)] transition-colors">
-                      <td className="p-3">
-                        <span className={`text-[10px] px-2 py-1 rounded-full border uppercase font-bold
-                          ${row.source === 'browser' ? 'bg-[#06B6D4]/10 text-[#06B6D4] border-[#06B6D4]/30' : 
-                            row.source === 'traccar' ? 'bg-[#8B5CF6]/10 text-[#8B5CF6] border-[#8B5CF6]/30' : 
-                            row.source === 'iot' ? 'bg-[#F97316]/10 text-[#F97316] border-[#F97316]/30' : 
-                            'bg-gray-500/10 text-gray-400 border-gray-500/30'}`}
-                        >
-                          {row.source}
-                        </span>
-                      </td>
-                      <td className="p-3">{row.device_id}</td>
-                      <td className="p-3 font-inter">{row.latitude.toFixed(5)}, {row.longitude.toFixed(5)}</td>
-                      <td className="p-3 text-[#F59E0B] font-inter">{(row.speed || 0).toFixed(1)}</td>
-                      <td className="p-3 text-[#06B6D4] font-inter">{row.accuracy ? `${row.accuracy.toFixed(1)}m` : '—'}</td>
-                      <td className="p-3 text-[var(--text-3)]">
-                        {(() => {
-                          const timeStr = row.timestamp || row.recorded_at || row.updated_at || '';
-                          if (!timeStr) return '—';
-                          try {
-                            const d = new Date(timeStr);
-                            if (isNaN(d.getTime())) return timeStr;
-                            return d.toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour12: false });
-                          } catch(e) { return timeStr; }
-                        })()}
-                      </td>
-                    </tr>
-                  ))
+                  historyData.map((row) => {
+                    const rawTime = row.device_time || row.timestamp || row.recorded_at || row.updated_at || '';
+                    return (
+                      <tr key={row.id} className="border-b border-[var(--row-alt)] hover:bg-[var(--bg-card-hover)] transition-colors">
+                        <td className="p-3">
+                          <span className={`text-[10px] px-2 py-1 rounded-full border uppercase font-bold
+                            ${row.source === 'browser' ? 'bg-[#06B6D4]/10 text-[#06B6D4] border-[#06B6D4]/30' : 
+                              row.source === 'traccar' ? 'bg-[#8B5CF6]/10 text-[#8B5CF6] border-[#8B5CF6]/30' : 
+                              row.source === 'iot' ? 'bg-[#F97316]/10 text-[#F97316] border-[#F97316]/30' : 
+                              row.source === 'native' ? 'bg-[#10B981]/10 text-[#10B981] border-[#10B981]/30' :
+                              'bg-gray-500/10 text-gray-400 border-gray-500/30'}`}
+                          >
+                            {row.source}
+                          </span>
+                        </td>
+                        <td className="p-3">{row.device_id}</td>
+                        <td className="p-3 font-inter">{row.latitude.toFixed(5)}, {row.longitude.toFixed(5)}</td>
+                        <td className="p-3 text-[#F59E0B] font-inter">{(row.speed || 0).toFixed(1)}</td>
+                        <td className="p-3 text-[#06B6D4] font-inter">{row.accuracy ? `${row.accuracy.toFixed(1)}m` : '—'}</td>
+                        <td className="p-3 text-[var(--text-2)] font-inter">{formatDateTH(rawTime)}</td>
+                        <td className="p-3 text-[var(--text-3)] font-inter">{formatTimeTH(rawTime)}</td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>

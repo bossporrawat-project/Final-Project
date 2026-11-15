@@ -8,14 +8,14 @@ export interface GPSPosition {
   timestamp: string;
 }
 
-export function useBrowserGPS(intervalSec: number = 2) {
+export function useBrowserGPS() {
   const [gpsOn, setGpsOn] = useState(false);
   const [position, setPosition] = useState<GPSPosition | null>(null);
   const [error, setError] = useState<string | null>(null);
   
   const watchIdRef = useRef<number | null>(null);
-  const intervalIdRef = useRef<NodeJS.Timeout | null>(null);
-  const latestPosRef = useRef<GeolocationCoordinates | null>(null);
+  const lastPosRef = useRef<GPSPosition | null>(null);
+  const sendIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const startGPS = useCallback(() => {
     if (typeof navigator === 'undefined' || !navigator.geolocation) {
@@ -26,63 +26,49 @@ export function useBrowserGPS(intervalSec: number = 2) {
     setGpsOn(true);
     setError(null);
     
-    if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-    }
-    if (intervalIdRef.current !== null) {
-      clearInterval(intervalIdRef.current);
-    }
-
-    // Keep cache updated using watchPosition
+    // 1. Initial fix and continuous watch
     watchIdRef.current = navigator.geolocation.watchPosition(
       (p) => {
-        latestPosRef.current = p.coords;
+        const { latitude, longitude, speed: raw, accuracy } = p.coords;
+        const speed = raw ? raw * 3.6 : 0;
+        const timestamp = new Date(p.timestamp || Date.now()).toISOString();
+        const pos = { latitude, longitude, speed, accuracy, timestamp };
+        lastPosRef.current = pos;
+        setPosition(pos);
       },
       (e) => {
-        console.warn('GPS:', e.message);
-        setError(e.message);
+        console.warn('GPS Warning:', e.message);
+        // Only set error if permission denied (don't alert on transient timeout)
         if (e.code === e.PERMISSION_DENIED) {
-           setGpsOn(false);
+          setError(e.message);
         }
       },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 5000 }
     );
 
-    // Emit to state every intervalSec
-    intervalIdRef.current = setInterval(() => {
-      if (latestPosRef.current) {
-        const { latitude, longitude, speed: raw, accuracy } = latestPosRef.current;
-        const speed = raw ? raw * 3.6 : 0;
-        const timestamp = new Date().toISOString();
-        setPosition({ latitude, longitude, speed, accuracy, timestamp });
+    // 2. Periodic emitter for stationary updates
+    sendIntervalRef.current = setInterval(() => {
+      if (lastPosRef.current) {
+        setPosition({ ...lastPosRef.current, timestamp: new Date().toISOString() });
       }
-    }, Math.max(1000, intervalSec * 1000));
-
-  }, [intervalSec]);
+    }, 2000);
+  }, []);
 
   const stopGPS = useCallback(() => {
     if (watchIdRef.current !== null) {
       navigator.geolocation.clearWatch(watchIdRef.current);
       watchIdRef.current = null;
     }
-    if (intervalIdRef.current !== null) {
-      clearInterval(intervalIdRef.current);
-      intervalIdRef.current = null;
+    if (sendIntervalRef.current) {
+      clearInterval(sendIntervalRef.current);
+      sendIntervalRef.current = null;
     }
     setGpsOn(false);
-    latestPosRef.current = null;
   }, []);
 
   useEffect(() => {
-    // If GPS is currently on and interval changes, restart it to apply new interval
-    if (gpsOn) {
-      startGPS();
-    }
-    return () => {
-      if (intervalIdRef.current) clearInterval(intervalIdRef.current);
-      if (watchIdRef.current) navigator.geolocation.clearWatch(watchIdRef.current);
-    };
-  }, [intervalSec]); // removed startGPS from deps to avoid infinite loop when interval changes, wait, startGPS depends on intervalSec so it's fine.
+    return () => stopGPS();
+  }, [stopGPS]);
 
   return { gpsOn, startGPS, stopGPS, position, error };
 }

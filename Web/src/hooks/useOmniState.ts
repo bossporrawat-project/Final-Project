@@ -10,8 +10,11 @@ export interface Position {
   accuracy?: number | null;
   source: string;
   is_online?: boolean;
+  device_time?: string;
+  server_time?: string;
   updated_at?: string;
   recorded_at?: string;
+  timestamp?: string;
 }
 
 export interface FilterState {

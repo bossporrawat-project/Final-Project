@@ -1,5 +1,5 @@
-﻿import React from 'react';
-import { Moon, Sun, Globe, Crosshair, Smartphone } from 'lucide-react';
+import React from 'react';
+import { Moon, Sun, Globe, Crosshair, Smartphone, Pencil } from 'lucide-react';
 
 interface HeaderProps {
   deviceName: string;
@@ -7,12 +7,13 @@ interface HeaderProps {
   lang: 'th' | 'en';
   onToggleTheme: () => void;
   onToggleLang: () => void;
+  onChangeDeviceName?: () => void;
+  traccarError?: string | null;
   status: {
     supabase: boolean;
     gps: boolean;
     traccar: boolean;
   };
-  onChangeDeviceName?: () => void;
 }
 
 export default function Header({
@@ -21,8 +22,9 @@ export default function Header({
   lang,
   onToggleTheme,
   onToggleLang,
-  status,
   onChangeDeviceName,
+  traccarError,
+  status,
 }: HeaderProps) {
   return (
     <header id="hdr">
@@ -32,12 +34,14 @@ export default function Header({
           <span>Tracker by boss</span>
         </div>
         <div 
-          className="dev-badge" style={{ cursor: "pointer", transition: "0.2s" }} onMouseOver={(e) => e.currentTarget.style.opacity = "0.7"} onMouseOut={(e) => e.currentTarget.style.opacity = "1"} 
+          className="dev-badge" 
           onClick={onChangeDeviceName}
-          title="Click to change device name"
+          title="คลิกเพื่อเปลี่ยนชื่อ Device ของ Browser"
+          style={{ cursor: 'pointer', userSelect: 'none' }}
         >
           <Smartphone size={16} strokeWidth={1.5} className="text-[#06B6D4]" />
-          <span>Device:</span> <b id="my-dev">{deviceName || 'â€”'}</b>
+          <span>Device:</span> <b id="my-dev">{deviceName || '—'}</b>
+          <Pencil size={13} style={{ marginLeft: '4px', opacity: 0.7 }} />
         </div>
       </div>
       <div className="hdr-r">
@@ -50,7 +54,11 @@ export default function Header({
             <div className="sd"></div>
             <span>GPS</span>
           </div>
-          <div className={`si ${status.traccar ? 'on' : ''}`} id="st-trc">
+          <div 
+            className={`si ${status.traccar ? 'on' : ''}`} 
+            id="st-trc"
+            title={traccarError || (status.traccar ? 'Traccar เชื่อมต่อแล้ว' : 'Traccar Offline')}
+          >
             <div className="sd"></div>
             <span>Traccar</span>
           </div>
@@ -77,4 +85,3 @@ export default function Header({
     </header>
   );
 }
-

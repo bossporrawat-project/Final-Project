@@ -1,51 +1,177 @@
+'use client';
+
 import React, { useEffect, useRef } from 'react';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
+import { haversine, calculateBearing, formatDirectionTH } from '@/utils/calculations';
 
 interface MapComponentProps {
   theme: 'dark' | 'light';
   liveData?: any[];
   historyData?: any[];
+  clearSignal?: number;
 }
 
-export default function MapComponent({ theme, liveData = [], historyData = [] }: MapComponentProps) {
+function isValidPos(pos: any): boolean {
+  return (
+    pos != null &&
+    typeof pos.latitude === 'number' &&
+    typeof pos.longitude === 'number' &&
+    !isNaN(pos.latitude) &&
+    !isNaN(pos.longitude) &&
+    !(pos.latitude === 0 && pos.longitude === 0)
+  );
+}
+
+// Smooth sharp GPS corners using 1-pass Chaikin curve subdivision
+function smoothCoordinates(coords: [number, number][]): [number, number][] {
+  if (coords.length < 3) return coords;
+  const smoothed: [number, number][] = [coords[0]];
+  for (let i = 0; i < coords.length - 1; i++) {
+    const p0 = coords[i];
+    const p1 = coords[i + 1];
+    const q: [number, number] = [0.75 * p0[0] + 0.25 * p1[0], 0.75 * p0[1] + 0.25 * p1[1]];
+    const r: [number, number] = [0.25 * p0[0] + 0.75 * p1[0], 0.25 * p0[1] + 0.75 * p1[1]];
+    smoothed.push(q, r);
+  }
+  smoothed.push(coords[coords.length - 1]);
+  return smoothed;
+}
+
+function formatDateTH(raw?: string) {
+  if (!raw) return '—';
+  try {
+    const d = new Date(raw);
+    if (!isNaN(d.getTime())) {
+      return d.toLocaleDateString('en-GB', { timeZone: 'Asia/Bangkok', day: '2-digit', month: '2-digit', year: 'numeric' });
+    }
+  } catch {}
+  return '—';
+}
+
+function formatTimeTH(raw?: string) {
+  if (!raw) return '—';
+  try {
+    const d = new Date(raw);
+    if (!isNaN(d.getTime())) {
+      return d.toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour12: false });
+    }
+  } catch {}
+  return raw;
+}
+
+function buildArrowSvg(bearing: number | null, size: number = 11) {
+  if (bearing == null || isNaN(bearing)) {
+    return `<span style="width:5px;height:5px;border-radius:50%;background:#ffffff;display:block;"></span>`;
+  }
+  const deg = Math.round(bearing);
+  return `
+    <svg width="${size}" height="${size}" viewBox="0 0 24 24" style="transform: rotate(${deg}deg); display: block;">
+      <path d="M12 2L19 20L12 16L5 20L12 2Z" fill="#FFFFFF" />
+    </svg>
+  `;
+}
+
+export default function MapComponent({ theme, liveData = [], historyData = [], clearSignal = 0 }: MapComponentProps) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
   const tileLayerRef = useRef<L.TileLayer | null>(null);
   const markersGroupRef = useRef<L.LayerGroup | null>(null);
   const linesGroupRef = useRef<L.LayerGroup | null>(null);
+  const dotsGroupRef = useRef<L.LayerGroup | null>(null);
 
-  const getSourceColor = (src: string) => {
+  // Persistent layer registries so open popups are never destroyed on live data updates
+  // and old points are NEVER deleted until Clear is clicked
+  const accumulatedByDeviceRef = useRef<Record<string, Map<string, any>>>({});
+  const liveMarkersRef = useRef<Record<string, L.Marker>>({});
+  const dotMarkersRef = useRef<Record<string, L.Marker>>({});
+  const routeLayersRef = useRef<Record<string, { casing: L.Polyline; main: L.Polyline; flow: L.Polyline }>>({});
+
+  const getSourceColor = (src?: string) => {
     switch (src) {
       case 'browser': return '#06B6D4'; // Cyan
       case 'traccar': return '#8B5CF6'; // Purple
-      case 'iot': return '#F97316'; // Orange
-      default: return '#94A3B8'; // Slate
+      case 'iot':     return '#F97316'; // Orange
+      case 'native':  return '#10B981'; // Emerald
+      default:        return '#94A3B8'; // Slate
     }
   };
 
+  // Initialize Leaflet map once and clean up on unmount / Fast Refresh
   useEffect(() => {
-    if (!mapRef.current) {
-      mapRef.current = L.map('map', {
-        center: [14.0724, 100.6011],
-        zoom: 13,
-        zoomControl: true,
-        attributionControl: false,
-      });
+    const el = containerRef.current;
+    if (!el) return;
 
-      L.control
-        .attribution({ prefix: false, position: 'bottomleft' })
-        .addAttribution(
-          '© <a href="https://www.openstreetmap.org/copyright">OSM</a>'
-        )
-        .addTo(mapRef.current);
-        
-      markersGroupRef.current = L.layerGroup().addTo(mapRef.current);
-      linesGroupRef.current = L.layerGroup().addTo(mapRef.current);
+    if (mapRef.current) {
+      try {
+        mapRef.current.remove();
+      } catch {}
+      mapRef.current = null;
+    }
+    if ((el as any)._leaflet_id) {
+      delete (el as any)._leaflet_id;
+      el.innerHTML = '';
     }
 
+    const map = L.map(el, {
+      center: [14.0724, 100.6011],
+      zoom: 14,
+      zoomControl: true,
+      attributionControl: false,
+    });
+
+    tileLayerRef.current = L.tileLayer(
+      'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+      { maxZoom: 19, className: theme === 'dark' ? 'dark-tiles' : '' }
+    ).addTo(map);
+
+    L.control
+      .attribution({ prefix: false, position: 'bottomleft' })
+      .addAttribution('© <a href="https://www.openstreetmap.org/copyright">OSM</a>')
+      .addTo(map);
+
+    linesGroupRef.current = L.layerGroup().addTo(map);
+    dotsGroupRef.current = L.layerGroup().addTo(map);
+    markersGroupRef.current = L.layerGroup().addTo(map);
+    mapRef.current = map;
+
+    const timer = setTimeout(() => {
+      map.invalidateSize();
+    }, 100);
+
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => {
+        map.invalidateSize();
+      });
+      ro.observe(el);
+    }
+
+    return () => {
+      clearTimeout(timer);
+      if (ro) ro.disconnect();
+      liveMarkersRef.current = {};
+      dotMarkersRef.current = {};
+      routeLayersRef.current = {};
+      tileLayerRef.current = null;
+      linesGroupRef.current = null;
+      dotsGroupRef.current = null;
+      markersGroupRef.current = null;
+      try {
+        map.remove();
+      } catch {}
+      if ((el as any)._leaflet_id) {
+        delete (el as any)._leaflet_id;
+      }
+      mapRef.current = null;
+    };
+  }, []);
+
+  // Update tile layer when theme changes
+  useEffect(() => {
     const map = mapRef.current;
-    
-    // Update theme
+    if (!map) return;
+
     if (tileLayerRef.current) {
       map.removeLayer(tileLayerRef.current);
     }
@@ -54,94 +180,361 @@ export default function MapComponent({ theme, liveData = [], historyData = [] }:
       'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
       { maxZoom: 19, className: theme === 'dark' ? 'dark-tiles' : '' }
     ).addTo(map);
-
-    return () => {
-      // Don't remove map to preserve state, just handled via react
-    };
   }, [theme]);
-  
+
+  // Clear all accumulated points and markers ONLY when the user clicks Clear
+  useEffect(() => {
+    if (clearSignal === 0) return;
+    accumulatedByDeviceRef.current = {};
+    liveMarkersRef.current = {};
+    dotMarkersRef.current = {};
+    routeLayersRef.current = {};
+    linesGroupRef.current?.clearLayers();
+    dotsGroupRef.current?.clearLayers();
+    markersGroupRef.current?.clearLayers();
+  }, [clearSignal]);
+
   const hasFittedBounds = useRef(false);
 
-  // Update Markers and Lines
+  // Update Route Ribbons, Directional Waypoint Dots, and Live Markers in-place without closing popups or deleting old points
   useEffect(() => {
-    if (!mapRef.current || !markersGroupRef.current || !linesGroupRef.current) return;
-    
-    markersGroupRef.current.clearLayers();
-    linesGroupRef.current.clearLayers();
-    
+    if (!mapRef.current || !markersGroupRef.current || !linesGroupRef.current || !dotsGroupRef.current) return;
+
     const bounds = L.latLngBounds([]);
-    
-    // 1. Draw historical paths (Polylines)
-    const historyByDevice: Record<string, any[]> = {};
-    historyData.forEach(pos => {
-      if (pos.latitude === 0 && pos.longitude === 0) return;
-      if (!historyByDevice[pos.device_id]) historyByDevice[pos.device_id] = [];
-      historyByDevice[pos.device_id].push(pos);
+
+    // 1. Permanently accumulate every valid historical & live point per device
+    const ingestPoint = (pos: any, isFromLive: boolean = false) => {
+      if (!isValidPos(pos) || !pos.device_id) return;
+      const devId = pos.device_id;
+      if (!accumulatedByDeviceRef.current[devId]) {
+        accumulatedByDeviceRef.current[devId] = new Map<string, any>();
+      }
+      const ptMap = accumulatedByDeviceRef.current[devId];
+      const rawTime = pos.device_time || pos.recorded_at || pos.updated_at || pos.timestamp || '';
+      const coordKey = `${pos.latitude.toFixed(6)}_${pos.longitude.toFixed(6)}`;
+      // Use coordinate+time key for live updates so moving live positions never overwrite older points
+      const pointKey = (!isFromLive && pos.id) ? String(pos.id) : `${coordKey}_${rawTime}`;
+
+      // Avoid adding duplicate stationary live heartbeats at the exact same coordinate as the most recent entry
+      if (isFromLive && ptMap.size > 0) {
+        const allPts = Array.from(ptMap.values());
+        const lastPt = allPts[allPts.length - 1];
+        if (
+          lastPt &&
+          Math.abs(lastPt.latitude - pos.latitude) < 0.000002 &&
+          Math.abs(lastPt.longitude - pos.longitude) < 0.000002
+        ) {
+          return;
+        }
+      }
+
+      if (!ptMap.has(pointKey)) {
+        ptMap.set(pointKey, { ...pos, _pointKey: pointKey });
+      }
+    };
+
+    historyData.forEach((pos) => ingestPoint(pos, false));
+    liveData.forEach((livePos) => ingestPoint(livePos, true));
+
+    const latestBearingByDevice: Record<string, number | null> = {};
+
+    // 2. Render / update route ribbons + all accumulated waypoint dots with direction arrows
+    Object.keys(accumulatedByDeviceRef.current).forEach((deviceId) => {
+      const ptMap = accumulatedByDeviceRef.current[deviceId];
+      const points = Array.from(ptMap.values());
+      if (points.length === 0) return;
+
+      points.sort(
+        (a, b) =>
+          new Date(a.device_time || a.recorded_at || a.updated_at || a.timestamp || 0).getTime() -
+          new Date(b.device_time || b.recorded_at || b.updated_at || b.timestamp || 0).getTime()
+      );
+
+      // Deduplicate only points that have identical coordinates AND identical timestamps
+      const uniquePoints: any[] = [];
+      points.forEach((pt) => {
+        const prev = uniquePoints[uniquePoints.length - 1];
+        const ptTime = pt.device_time || pt.recorded_at || pt.updated_at || pt.timestamp || '';
+        const prevTime = prev ? (prev.device_time || prev.recorded_at || prev.updated_at || prev.timestamp || '') : '';
+        if (
+          !prev ||
+          Math.abs(prev.latitude - pt.latitude) > 0.000001 ||
+          Math.abs(prev.longitude - pt.longitude) > 0.000001 ||
+          ptTime !== prevTime
+        ) {
+          uniquePoints.push(pt);
+        }
+      });
+
+      const color = getSourceColor(uniquePoints[0]?.source || 'browser');
+
+      // Distinct coordinate sequence for clean polyline drawing
+      const linePoints: any[] = [];
+      uniquePoints.forEach((pt) => {
+        const prev = linePoints[linePoints.length - 1];
+        if (!prev || Math.abs(prev.latitude - pt.latitude) > 0.000001 || Math.abs(prev.longitude - pt.longitude) > 0.000001) {
+          linePoints.push(pt);
+        }
+      });
+
+      let totalDistMeters = 0;
+      for (let i = 1; i < linePoints.length; i++) {
+        totalDistMeters += haversine(
+          linePoints[i - 1].latitude,
+          linePoints[i - 1].longitude,
+          linePoints[i].latitude,
+          linePoints[i].longitude
+        );
+      }
+
+      if (linePoints.length >= 2) {
+        const rawCoords = linePoints.map((p) => [p.latitude, p.longitude] as [number, number]);
+        const smoothCoords = smoothCoordinates(rawCoords);
+
+        const firstPt = linePoints[0];
+        const lastPt = linePoints[linePoints.length - 1];
+        const firstRawTime = firstPt.device_time || firstPt.recorded_at || firstPt.updated_at || '';
+        const lastRawTime = lastPt.device_time || lastPt.recorded_at || lastPt.updated_at || '';
+        const overallBearing = calculateBearing(firstPt.latitude, firstPt.longitude, lastPt.latitude, lastPt.longitude);
+        const distLabel =
+          totalDistMeters >= 1000
+            ? `${(totalDistMeters / 1000).toFixed(2)} km`
+            : `${Math.round(totalDistMeters)} m`;
+
+        const routePopup = `
+          <div class="pp-t" style="color: ${color}; border-bottom: 1px solid ${color}40; padding-bottom: 4px; margin-bottom: 6px;">
+            🛣️ เส้นทาง — ${deviceId}
+          </div>
+          <div class="pp-r"><span class="l">ระยะทางรวม:</span><span class="v" style="color: ${color}; font-weight: 700;">${distLabel}</span></div>
+          <div class="pp-r"><span class="l">ทิศทางรวม:</span><span class="v">${formatDirectionTH(overallBearing)}</span></div>
+          <div class="pp-r"><span class="l">จำนวนจุด:</span><span class="v">${uniquePoints.length} จุด</span></div>
+          <div class="pp-r"><span class="l">เริ่มต้น:</span><span class="v">${formatDateTH(firstRawTime)} ${formatTimeTH(firstRawTime)}</span></div>
+          <div class="pp-r"><span class="l">ล่าสุด:</span><span class="v">${formatDateTH(lastRawTime)} ${formatTimeTH(lastRawTime)}</span></div>
+        `;
+
+        const existingRoute = routeLayersRef.current[deviceId];
+        if (existingRoute) {
+          existingRoute.casing.setLatLngs(smoothCoords);
+          existingRoute.casing.setStyle({ color: theme === 'dark' ? '#090D16' : '#FFFFFF' });
+          existingRoute.main.setLatLngs(smoothCoords);
+          existingRoute.main.setStyle({ color });
+          existingRoute.main.setPopupContent(routePopup);
+          existingRoute.flow.setLatLngs(smoothCoords);
+          existingRoute.flow.setPopupContent(routePopup);
+        } else {
+          const casing = L.polyline(smoothCoords, {
+            color: theme === 'dark' ? '#090D16' : '#FFFFFF',
+            weight: 7,
+            opacity: 0.8,
+            lineCap: 'round',
+            lineJoin: 'round',
+          });
+          const main = L.polyline(smoothCoords, {
+            color: color,
+            weight: 4,
+            opacity: 0.95,
+            lineCap: 'round',
+            lineJoin: 'round',
+          });
+          const flow = L.polyline(smoothCoords, {
+            color: '#FFFFFF',
+            weight: 1.8,
+            opacity: 0.8,
+            dashArray: '6, 14',
+            lineCap: 'round',
+            lineJoin: 'round',
+            className: 'route-flow-line',
+          });
+
+          main.bindPopup(routePopup, { autoClose: false, closeOnClick: false });
+          flow.bindPopup(routePopup, { autoClose: false, closeOnClick: false });
+
+          linesGroupRef.current?.addLayer(casing);
+          linesGroupRef.current?.addLayer(main);
+          linesGroupRef.current?.addLayer(flow);
+          routeLayersRef.current[deviceId] = { casing, main, flow };
+        }
+      }
+
+      // Draw or update every historical waypoint dot with its heading direction arrow
+      uniquePoints.forEach((pt, idx) => {
+        const ptTime = pt.device_time || pt.timestamp || pt.recorded_at || pt.updated_at || '';
+        const isStart = idx === 0 && uniquePoints.length > 1;
+        const dotKey = `${deviceId}_${pt._pointKey || pt.id || `${pt.latitude.toFixed(6)}_${pt.longitude.toFixed(6)}_${idx}`}`;
+
+        // Calculate the direction this point goes (to the next distinct coordinate, or from the previous distinct coordinate)
+        let bearing: number | null = null;
+        let nextTargetIdx: number | null = null;
+
+        for (let j = idx + 1; j < uniquePoints.length; j++) {
+          if (
+            Math.abs(uniquePoints[j].latitude - pt.latitude) > 0.000002 ||
+            Math.abs(uniquePoints[j].longitude - pt.longitude) > 0.000002
+          ) {
+            bearing = calculateBearing(pt.latitude, pt.longitude, uniquePoints[j].latitude, uniquePoints[j].longitude);
+            nextTargetIdx = j;
+            break;
+          }
+        }
+
+        if (bearing === null) {
+          for (let j = idx - 1; j >= 0; j--) {
+            if (
+              Math.abs(uniquePoints[j].latitude - pt.latitude) > 0.000002 ||
+              Math.abs(uniquePoints[j].longitude - pt.longitude) > 0.000002
+            ) {
+              bearing = calculateBearing(uniquePoints[j].latitude, uniquePoints[j].longitude, pt.latitude, pt.longitude);
+              break;
+            }
+          }
+        }
+
+        if (idx === uniquePoints.length - 1) {
+          latestBearingByDevice[deviceId] = bearing;
+        }
+
+        const targetLabel =
+          nextTargetIdx !== null
+            ? `จุดที่ #${nextTargetIdx + 1}`
+            : idx < uniquePoints.length - 1
+            ? `จุดที่ #${idx + 2}`
+            : 'จุดล่าสุด (ปัจจุบัน)';
+
+        const dotPopup = `
+          <div class="pp-t" style="color: ${color}; border-bottom: 1px solid ${color}40; padding-bottom: 4px; margin-bottom: 6px;">
+            ${isStart ? '🏁 จุดเริ่มต้น (#1)' : `📍 จุดที่ #${idx + 1}`} — ${deviceId}
+          </div>
+          <div class="pp-r"><span class="l">Direction:</span><span class="v" style="color: ${color}; font-weight: 700;">${formatDirectionTH(bearing)}</span></div>
+          <div class="pp-r"><span class="l">มุ่งหน้าไป:</span><span class="v">${targetLabel}</span></div>
+          <div class="pp-r"><span class="l">Lat/Lng:</span><span class="v">${pt.latitude.toFixed(6)}, ${pt.longitude.toFixed(6)}</span></div>
+          <div class="pp-r"><span class="l">Speed:</span><span class="v">${Number(pt.speed || 0).toFixed(1)} km/h</span></div>
+          <div class="pp-r"><span class="l">Date:</span><span class="v">${formatDateTH(ptTime)}</span></div>
+          <div class="pp-r"><span class="l">Time:</span><span class="v">${formatTimeTH(ptTime)}</span></div>
+        `;
+
+        const roundedBearing = bearing !== null ? Math.round(bearing) : null;
+        const iconSize: [number, number] = isStart ? [20, 20] : [18, 18];
+        const iconAnchor: [number, number] = isStart ? [10, 10] : [9, 9];
+
+        const makeWaypointIcon = () =>
+          L.divIcon({
+            className: '',
+            html: `
+              <div class="${isStart ? 'wp-dir-start' : 'wp-dir-marker'}" style="${isStart ? '' : `background: ${color};`}">
+                ${buildArrowSvg(roundedBearing, isStart ? 12 : 10)}
+              </div>
+            `,
+            iconSize,
+            iconAnchor,
+          });
+
+        const existingDot = dotMarkersRef.current[dotKey];
+        if (existingDot) {
+          existingDot.setLatLng([pt.latitude, pt.longitude]);
+          existingDot.setPopupContent(dotPopup);
+          if ((existingDot as any)._bearing !== roundedBearing || (existingDot as any)._isStart !== isStart) {
+            existingDot.setIcon(makeWaypointIcon());
+            (existingDot as any)._bearing = roundedBearing;
+            (existingDot as any)._isStart = isStart;
+          }
+        } else {
+          const wpMarker = L.marker([pt.latitude, pt.longitude], {
+            icon: makeWaypointIcon(),
+            zIndexOffset: isStart ? 100 : -50,
+          });
+          (wpMarker as any)._bearing = roundedBearing;
+          (wpMarker as any)._isStart = isStart;
+          wpMarker.bindPopup(dotPopup, { autoClose: false, closeOnClick: false });
+          dotsGroupRef.current?.addLayer(wpMarker);
+          dotMarkersRef.current[dotKey] = wpMarker;
+        }
+      });
     });
 
-    Object.keys(historyByDevice).forEach(deviceId => {
-      const points = historyByDevice[deviceId];
-      // Sort by time ascending
-      points.sort((a, b) => new Date(a.recorded_at || a.updated_at || 0).getTime() - new Date(b.recorded_at || b.updated_at || 0).getTime());
-      
-      const latlngs = points.map(p => [p.latitude, p.longitude] as [number, number]);
-      const color = getSourceColor(points[0].source);
-      
-      const polyline = L.polyline(latlngs, {
-        color: color,
-        weight: 3,
-        opacity: 0.5,
-        dashArray: '5, 8',
-        lineJoin: 'round'
-      });
-      linesGroupRef.current?.addLayer(polyline);
-    });
+    // 3. Draw or update live markers in-place with direction arrow (never deleting existing live markers unless cleared)
+    liveData.forEach((pos) => {
+      if (!isValidPos(pos) || !pos.device_id) return;
 
-    // 2. Draw live markers
-    liveData.forEach(pos => {
-      // Don't plot dummy status coordinates
-      if (pos.latitude === 0 && pos.longitude === 0) return;
+      const devId = pos.device_id;
+      const srcName = String(pos.source || 'browser');
+      const color = getSourceColor(srcName);
+      const rawTime = (pos as any).device_time || pos.timestamp || (pos as any).updated_at || (pos as any).recorded_at || '';
+      const liveBearing = latestBearingByDevice[devId] ?? null;
+      const roundedLiveBearing = liveBearing !== null ? Math.round(liveBearing) : null;
 
-      const color = getSourceColor(pos.source);
-      const marker = L.circleMarker([pos.latitude, pos.longitude], {
-        radius: 8,
-        fillColor: color,
-        color: '#FFFFFF',
-        weight: 2,
-        opacity: 1,
-        fillOpacity: 0.9
-      });
-      
       const popupContent = `
         <div class="pp-t" style="color: ${color}; border-bottom: 1px solid ${color}40; padding-bottom: 4px; margin-bottom: 8px;">
-          ${pos.source.toUpperCase()} - ${pos.device_id}
+          ${srcName.toUpperCase()} — ${pos.device_id}
         </div>
+        <div class="pp-r"><span class="l">Direction:</span><span class="v" style="color: ${color}; font-weight: 700;">${formatDirectionTH(liveBearing)}</span></div>
         <div class="pp-r"><span class="l">Lat:</span><span class="v">${pos.latitude.toFixed(6)}</span></div>
         <div class="pp-r"><span class="l">Lng:</span><span class="v">${pos.longitude.toFixed(6)}</span></div>
-        <div class="pp-r"><span class="l">Speed:</span><span class="v">${(pos.speed || 0).toFixed(1)} km/h</span></div>
-        <div class="pp-r"><span class="l">Time:</span><span class="v">${(() => { const timeStr = pos.timestamp || (pos as any).updated_at || (pos as any).recorded_at || ''; try { const d = new Date(timeStr); if (!isNaN(d.getTime())) return d.toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour12: false }); } catch(e) {} return timeStr; })()}</span></div>
+        <div class="pp-r"><span class="l">Speed:</span><span class="v">${Number(pos.speed || 0).toFixed(1)} km/h</span></div>
+        <div class="pp-r"><span class="l">Date:</span><span class="v">${formatDateTH(rawTime)}</span></div>
+        <div class="pp-r"><span class="l">Time:</span><span class="v">${formatTimeTH(rawTime)}</span></div>
       `;
-      
-      marker.bindPopup(popupContent);
-      
-      // Permanent Tooltip to always show device name
-      marker.bindTooltip(`<b>${pos.device_id}</b>`, {
-        permanent: true,
-        direction: 'right',
-        className: 'device-tooltip',
-        offset: [10, 0]
-      });
 
-      markersGroupRef.current?.addLayer(marker);
+      const makeLiveIcon = () =>
+        L.divIcon({
+          className: '',
+          html: `
+            <div class="live-marker-wrap">
+              <div class="live-marker-core" style="background: ${color};">
+                ${buildArrowSvg(roundedLiveBearing, 11)}
+              </div>
+            </div>
+          `,
+          iconSize: [22, 22],
+          iconAnchor: [11, 11],
+        });
+
+      const existingLive = liveMarkersRef.current[devId];
+      if (existingLive) {
+        existingLive.setLatLng([pos.latitude, pos.longitude]);
+        existingLive.setPopupContent(popupContent);
+        if ((existingLive as any)._bearing !== roundedLiveBearing) {
+          existingLive.setIcon(makeLiveIcon());
+          (existingLive as any)._bearing = roundedLiveBearing;
+        }
+      } else {
+        const marker = L.marker([pos.latitude, pos.longitude], {
+          icon: makeLiveIcon(),
+          zIndexOffset: 500,
+        });
+        (marker as any)._bearing = roundedLiveBearing;
+        marker.bindPopup(popupContent, { autoClose: false, closeOnClick: false });
+        marker.bindTooltip(`<span style="color:${color}">●</span> ${pos.device_id}`, {
+          permanent: true,
+          direction: 'right',
+          className: 'device-tooltip',
+          offset: [12, 0],
+        });
+
+        markersGroupRef.current?.addLayer(marker);
+        liveMarkersRef.current[devId] = marker;
+      }
+
       bounds.extend([pos.latitude, pos.longitude]);
     });
-    
+
     if (liveData.length > 0 && bounds.isValid() && !hasFittedBounds.current) {
-      mapRef.current.fitBounds(bounds, { padding: [50, 50], maxZoom: 16 });
+      mapRef.current.fitBounds(bounds, { padding: [55, 55], maxZoom: 16 });
       hasFittedBounds.current = true;
     }
-    
-  }, [liveData, historyData]);
+  }, [liveData, historyData, theme]);
 
-  return <div id="map" />;
+  return (
+    <div
+      id="map"
+      ref={containerRef}
+      style={{
+        position: 'absolute',
+        inset: 0,
+        width: '100%',
+        height: '100%',
+        minHeight: '380px',
+        zIndex: 1,
+      }}
+    />
+  );
 }
