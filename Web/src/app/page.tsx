@@ -217,11 +217,18 @@ export default function Dashboard() {
         .select('*')
         .order('updated_at', { ascending: false, nullsFirst: false });
 
-      // Try server-side downsampling & centroid RPCs (scales to 1M+ rows), with graceful fallback if RPCs aren't deployed yet
-      const [decimatedRes, centroidRes] = await Promise.all([
-        client.rpc('get_route_decimated', { p_points_per_device: 600 }),
+      // Call server-side downsampling RPC per device (p_points_per_device: 300 guarantees <= 599 rows < PostgREST 1000 cap even at 1M+ rows/device)
+      const perDeviceRpcQueries = (liveData || []).map((dev: any) =>
+        client.rpc('get_route_decimated', {
+          p_points_per_device: 300,
+          p_device_id: dev.device_id
+        })
+      );
+
+      const [centroidRes, _pageRes, ...perDeviceRpcResults] = await Promise.all([
         client.rpc('get_history_centroid'),
-        loadHistoryPage(1, 'all', 'all', client)
+        loadHistoryPage(1, 'all', 'all', client),
+        ...perDeviceRpcQueries
       ]);
 
       if (
@@ -237,9 +244,22 @@ export default function Dashboard() {
         });
       }
 
+      const rpcSucceeded =
+        perDeviceRpcResults.length > 0 &&
+        perDeviceRpcResults.some((r: any) => !r?.error && Array.isArray(r?.data) && r.data.length > 0);
+
       let historyData: any[] = [];
-      if (!decimatedRes?.error && Array.isArray(decimatedRes?.data) && decimatedRes.data.length > 0) {
-        historyData = decimatedRes.data;
+      if (rpcSucceeded) {
+        const mergedRpcMap = new Map<string, any>();
+        perDeviceRpcResults.forEach((res: any) => {
+          if (!res?.error && Array.isArray(res?.data)) {
+            res.data.forEach((row: any) => {
+              const key = makeHistKey(row);
+              if (!mergedRpcMap.has(key)) mergedRpcMap.set(key, row);
+            });
+          }
+        });
+        historyData = Array.from(mergedRpcMap.values());
       } else {
         // Fallback: fetch global recent + per-device latest 1,000 rows so all devices show route lines
         const perDeviceQueries = (liveData || []).map((dev: any) =>
