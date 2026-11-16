@@ -154,16 +154,50 @@ export default function Dashboard() {
       const client = getSupabaseClient(url, key);
       setSupabase(client);
       setSupaStatus(true);
-      // Fetch initial data ordered by actual server arrival time so skewed device clocks don't bury live records
+      // Fetch initial live positions ordered by actual server arrival time
       const { data: liveData } = await client
         .from('gps_positions')
         .select('*')
         .order('updated_at', { ascending: false, nullsFirst: false });
-      const { data: historyData } = await client
-        .from('gps_history')
-        .select('*')
-        .order('server_time', { ascending: false, nullsFirst: false })
-        .limit(10000);
+
+      // Fetch recent global history PLUS up to 1,000 rows per known device so high-frequency devices never crowd out other devices' routes
+      const perDeviceQueries = (liveData || []).map((dev: any) =>
+        client
+          .from('gps_history')
+          .select('*')
+          .eq('device_id', dev.device_id)
+          .order('server_time', { ascending: false, nullsFirst: false })
+          .limit(1000)
+      );
+
+      const [globalHistRes, ...perDeviceResList] = await Promise.all([
+        client
+          .from('gps_history')
+          .select('*')
+          .order('server_time', { ascending: false, nullsFirst: false })
+          .limit(1000),
+        ...perDeviceQueries
+      ]);
+
+      const mergedMap = new Map<string, any>();
+      const ingestHistRows = (rows?: any[] | null) => {
+        if (!Array.isArray(rows)) return;
+        rows.forEach((row) => {
+          const key = row.id
+            ? String(row.id)
+            : `${row.device_id}_${row.device_time || row.server_time || ''}_${row.latitude}_${row.longitude}`;
+          if (!mergedMap.has(key)) mergedMap.set(key, row);
+        });
+      };
+
+      ingestHistRows(globalHistRes?.data);
+      perDeviceResList.forEach((res) => ingestHistRows(res?.data));
+
+      const historyData = Array.from(mergedMap.values()).sort((a, b) => {
+        const ta = new Date(a.server_time || a.device_time || 0).getTime();
+        const tb = new Date(b.server_time || b.device_time || 0).getTime();
+        return tb - ta;
+      });
       
       const lastSeenSigByDev: Record<string, string> = {};
       if (liveData) {
@@ -174,7 +208,7 @@ export default function Dashboard() {
         });
         setLivePos(liveMap);
       }
-      if (historyData) setHistArr(historyData);
+      setHistArr(historyData);
 
       client.removeAllChannels();
 
