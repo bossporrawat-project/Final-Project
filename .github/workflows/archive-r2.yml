@@ -1,0 +1,41 @@
+name: Archive Old GPS History to Cloudflare R2
+
+on:
+  schedule:
+    # Runs automatically every 6 hours on GitHub Cloud
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  archive-to-r2:
+    name: Move old gps_history to Cloudflare R2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        working-directory: ./Web
+        run: npm ci || npm install
+
+      - name: Archive Supabase gps_history older than retention window to Cloudflare R2
+        working-directory: ./Web
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          ARCHIVE_RETENTION_HOURS: ${{ secrets.ARCHIVE_RETENTION_HOURS || '48' }}
+        run: |
+          if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$R2_ACCESS_KEY_ID" ] || [ -z "$R2_SECRET_ACCESS_KEY" ] || [ -z "$R2_BUCKET_NAME" ]; then
+            echo "R2 secrets not configured yet. Skipping archive run cleanly."
+            exit 0
+          fi
+          node ./scripts/archive-to-r2.mjs

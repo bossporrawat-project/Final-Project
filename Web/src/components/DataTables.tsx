@@ -1,5 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Locate, Activity, Cpu } from 'lucide-react';
+import CloudArchiveBar from '@/components/CloudArchiveBar';
 
 export interface PositionData {
   id: string;
@@ -28,6 +29,7 @@ interface DataTablesProps {
   historyPageSize?: number;
   onHistoryPageChange?: (page: number) => void;
   isHistoryLoading?: boolean;
+  onLoadArchivedPoints?: (rows: any[], date: string) => void;
 }
 
 function getTimestampMs(raw?: string): number {
@@ -64,6 +66,7 @@ export default function DataTables({
   historyPageSize = 50,
   onHistoryPageChange,
   isHistoryLoading = false,
+  onLoadArchivedPoints,
 }: DataTablesProps) {
   const [nowMs, setNowMs] = useState<number>(0);
   const [selectedBySlot, setSelectedBySlot] = useState<Record<string, string>>({});
@@ -283,6 +286,7 @@ export default function DataTables({
       </div>
 
       <div className="mt-8">
+        <CloudArchiveBar onLoadArchivedPoints={onLoadArchivedPoints} />
         <div className="dsec-header flex flex-wrap justify-between items-center gap-2 mb-4">
           <span>
             History Log ({(totalHistoryCount ?? historyData.length).toLocaleString()} records in DB)

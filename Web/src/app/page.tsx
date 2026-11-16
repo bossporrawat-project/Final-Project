@@ -1001,6 +1001,9 @@ export default function Dashboard() {
         historyPageSize={HISTORY_PAGE_SIZE}
         onHistoryPageChange={(nextPage) => loadHistoryPage(nextPage, filter.src, filter.dev)}
         isHistoryLoading={isHistoryLoading}
+        onLoadArchivedPoints={(rows) => {
+          rows.forEach((r) => appendHistoryPoint(r, false));
+        }}
       />
 
       <AnalysisPanel 

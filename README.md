@@ -289,6 +289,16 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.gps_history;
 * **`get_accuracy_analysis(p_ref_lat, p_ref_lng)` & `get_history_centroid()`:** คำนวณ Haversine Error, Mean, Std Dev, Min/Max และ Centroid บน PostgreSQL ทั้งหมด 1,000,000+ แถวแล้วส่งเฉพาะผลสรุปรายเครื่องกลับมาที่หน้าเว็บ
 * **Frontend Optimization:** แผนที่เปิด `preferCanvas: true` + Decimation (`decimatePoints`), History Log แบ่งหน้าแบบ Server-Side (`50` แถว/หน้า ด้วย `.range()`), และ Export CSV ดึงแบบ Chunk ทีละ 1,000 แถว
 
+### ☁️ ระบบเก็บข้อมูลถาวรบน Cloudflare R2 (`Hot / Cold Cloud Archive`)
+
+สำหรับเก็บข้อมูลระยะยาวระดับ **32+ ล้านแถว** โดยยังใช้ Supabase Free Plan (`500 MB`) ได้ตลอด:
+* **Hot (Supabase):** เก็บข้อมูลล่าสุด `24–48 ชั่วโมง` (`ARCHIVE_RETENTION_HOURS`) เพื่อใช้ Realtime และคำนวณสด
+* **Cold Archive (Cloudflare R2 ฟรี `10 GB`, Egress ฟรี `$0`):**
+  1. สร้าง Bucket บน **Cloudflare R2** (เช่น `omnitrack-gps-archive`) และสร้าง **R2 API Token** (`Object Read & Write`) เพื่อรับ `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`
+  2. เพิ่มตัวแปร `R2_*` ใน `Web/.env.local` (หรือ Vercel Environment Variables) และ GitHub Secrets
+  3. GitHub Actions workflow [`.github/workflows/archive-r2.yml`](./.github/workflows/archive-r2.yml) จะรันสคริปต์ `Web/scripts/archive-to-r2.mjs` อัตโนมัติทุก **6 ชั่วโมง** เพื่อบีบอัดข้อมูลเก่าเป็นไฟล์ `archives/YYYY-MM-DD/part_*.jsonl.gz` ขึ้น R2 แล้วจึงลบแถวที่อัปโหลดสำเร็จออกจาก `gps_history`
+  4. บนหน้าเว็บจะมีแถบ **Cloudflare R2 Cold Archive** ให้เลือกดูวันที่ย้อนหลัง, โหลดเข้าแผนที่ (`/api/archive?date=...`), หรือดาวน์โหลด `.csv` ได้ทันที
+
 ---
 
 ## 🔌 วิธีการเชื่อมต่อแต่ละส่วน (Connection Guide)
