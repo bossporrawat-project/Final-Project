@@ -1,11 +1,11 @@
 'use client';
 
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import Header from '@/components/Header';
 import ControlBar from '@/components/ControlBar';
 import MapArea from '@/components/MapArea';
 import DataTables from '@/components/DataTables';
-import AnalysisPanel from '@/components/AnalysisPanel';
+import AnalysisPanel, { ReferenceMode, DeviceAnalysisRow } from '@/components/AnalysisPanel';
 
 import { useLivePositions, useHistory, useTrackingSettings, Position } from '@/hooks/useOmniState';
 import { useBrowserGPS } from '@/hooks/useBrowserGPS';
@@ -13,6 +13,48 @@ import { useTraccar } from '@/hooks/useTraccar';
 import { useIoT } from '@/hooks/useIoT';
 import { getSupabaseClient } from '@/lib/supabaseClient';
 import { haversine, AnalysisStats } from '@/utils/calculations';
+
+const DEFAULT_ANALYSIS_STATS: AnalysisStats = {
+  samples: '-',
+  meanError: '-',
+  stdDev: '-',
+  min: '-',
+  max: '-',
+  avgAcc: '-',
+  barWidth: 0
+};
+
+function isValidCoord(p?: { latitude?: number; longitude?: number } | null): boolean {
+  return Boolean(
+    p &&
+    typeof p.latitude === 'number' &&
+    typeof p.longitude === 'number' &&
+    !isNaN(p.latitude) &&
+    !isNaN(p.longitude) &&
+    !(p.latitude === 0 && p.longitude === 0)
+  );
+}
+
+function computeStatsForPoints(points: Position[], refLatNum: number, refLngNum: number): AnalysisStats {
+  if (points.length === 0) return DEFAULT_ANALYSIS_STATS;
+  const errors = points.map(d => haversine(refLatNum, refLngNum, d.latitude, d.longitude));
+  const mean = errors.reduce((a, b) => a + b, 0) / errors.length;
+  const stdDev = Math.sqrt(errors.reduce((sq, n) => sq + Math.pow(n - mean, 2), 0) / errors.length);
+  const max = Math.max(...errors);
+  const min = Math.min(...errors);
+  const validAccs = points.filter(d => d.accuracy != null && !isNaN(Number(d.accuracy))).map(d => Number(d.accuracy));
+  const avgAcc = validAccs.length > 0 ? parseFloat((validAccs.reduce((a, b) => a + b, 0) / validAccs.length).toFixed(2)) : '-';
+
+  return {
+    samples: points.length,
+    meanError: parseFloat(mean.toFixed(2)),
+    stdDev: parseFloat(stdDev.toFixed(2)),
+    min: parseFloat(min.toFixed(2)),
+    max: parseFloat(max.toFixed(2)),
+    avgAcc,
+    barWidth: 0
+  };
+}
 
 const DEFAULT_SUPABASE_URL = 'https://ryuhkaytmlapkuumgnlo.supabase.co';
 const DEFAULT_SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ5dWhrYXl0bWxhcGt1dW1nbmxvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE1MzY4MjUsImV4cCI6MjEwNzExMjgyNX0.JYKrvAMK64xE5r92pepQy02fVl4mO55dMaz93heaee8';
@@ -27,14 +69,11 @@ export default function Dashboard() {
   const [traccarStatus, setTraccarStatus] = useState(false);
 
   // Analysis States
+  const [refMode, setRefMode] = useState<ReferenceMode>('centroid');
+  const [refDeviceId, setRefDeviceId] = useState('');
   const [refLat, setRefLat] = useState('');
   const [refLng, setRefLng] = useState('');
-  const [refStatus, setRefStatus] = useState('ไม่ได้ตั้งค่า');
-  const defaultStats: AnalysisStats = { samples: '-', meanError: '-', stdDev: '-', min: '-', max: '-', avgAcc: '-', barWidth: 0 };
-  const [browserStats, setBrowserStats] = useState<AnalysisStats>(defaultStats);
-  const [iotStats, setIotStats] = useState<AnalysisStats>(defaultStats);
-  const [traccarStats, setTraccarStats] = useState<AnalysisStats>(defaultStats);
-  const [nativeStats, setNativeStats] = useState<AnalysisStats>(defaultStats);
+  const [analysisTick, setAnalysisTick] = useState(0);
   const lastHistoryRecordRef = useRef<{ lat: number; lng: number; time: number } | null>(null);
   const lastTraccarRecordRef = useRef<Record<string, { lat: number; lng: number; time: number }>>({});
   const lastIoTRecordRef = useRef<Record<string, { lat: number; lng: number; timeStr: string; time: number }>>({});
@@ -429,61 +468,106 @@ export default function Dashboard() {
     setClearSignal(c => c + 1);
   };
 
-  // Analysis Handlers
-  const handleSetRefFromGPS = () => {
-    if (gpsPosition) {
-      setRefLat(gpsPosition.latitude.toFixed(6));
-      setRefLng(gpsPosition.longitude.toFixed(6));
-      setRefStatus('✓ ดึงพิกัด GPS สำเร็จ');
-    } else {
-      setRefStatus('❌ ไม่พบพิกัด GPS (เปิด Browser GPS ก่อน)');
-    }
+  // Data processing
+  const liveValues = Object.values(livePos);
+  const filteredLive = liveValues.filter(p => (filter.src === 'all' || p.source === filter.src) && (filter.dev === 'all' || p.device_id === filter.dev));
+  const filteredHist = histArr.filter(p => (filter.src === 'all' || p.source === filter.src) && (filter.dev === 'all' || p.device_id === filter.dev));
+
+  const stats = {
+    all: liveValues.length,
+    native: liveValues.filter(p => p.source === 'native').length,
+    browser: liveValues.filter(p => p.source === 'browser').length,
+    iot: liveValues.filter(p => p.source === 'iot').length,
+    traccar: liveValues.filter(p => p.source === 'traccar').length
   };
 
-  const handleRunAnalysis = () => {
-    const lat = parseFloat(refLat);
-    const lng = parseFloat(refLng);
-    if (isNaN(lat) || isNaN(lng)) {
-      setRefStatus('❌ พิกัดอ้างอิงไม่ถูกต้อง');
-      return;
+  const deviceOptions = Array.from(new Set([
+    ...liveValues.map((p: any) => p.device_id),
+    ...histArr.map((p: any) => p.device_id)
+  ])).filter(Boolean);
+
+  // Automatic real-time Accuracy Analysis
+  const autoAnalysis = useMemo(() => {
+    void analysisTick;
+    const validHist = histArr.filter(isValidCoord);
+    const validLive = liveValues.filter(isValidCoord);
+    const allValid = validHist.length > 0 ? validHist : validLive;
+
+    let resolvedLat: number | null = null;
+    let resolvedLng: number | null = null;
+    let statusMsg = 'กำลังคำนวณ...';
+
+    if (refMode === 'centroid') {
+      if (allValid.length > 0) {
+        resolvedLat = allValid.reduce((sum, p) => sum + p.latitude, 0) / allValid.length;
+        resolvedLng = allValid.reduce((sum, p) => sum + p.longitude, 0) / allValid.length;
+        statusMsg = `✓ Auto Centroid (ค่าเฉลี่ยอัตโนมัติจาก ${allValid.length} จุด)`;
+      } else {
+        statusMsg = 'รอข้อมูลพิกัดเพื่อคำนวณอัตโนมัติ...';
+      }
+    } else if (refMode === 'device') {
+      const targetId = refDeviceId || deviceOptions[0] || '';
+      const targetPoint =
+        validLive.find(p => p.device_id === targetId) ||
+        validHist.find(p => p.device_id === targetId) ||
+        null;
+      if (targetPoint) {
+        resolvedLat = targetPoint.latitude;
+        resolvedLng = targetPoint.longitude;
+        statusMsg = `✓ เทียบกับพิกัดล่าสุดของ "${targetId}"`;
+      } else {
+        statusMsg = targetId ? `❌ ไม่พบพิกัดของ "${targetId}"` : 'ยังไม่มี Device ให้เลือก';
+      }
+    } else if (refMode === 'gps') {
+      if (gpsPosition && isValidCoord(gpsPosition)) {
+        resolvedLat = gpsPosition.latitude;
+        resolvedLng = gpsPosition.longitude;
+        statusMsg = '✓ ใช้พิกัด Browser GPS สดอัตโนมัติ';
+      } else {
+        statusMsg = '📡 กำลังรอสัญญาณ Browser GPS...';
+      }
+    } else {
+      const latNum = parseFloat(refLat);
+      const lngNum = parseFloat(refLng);
+      if (!isNaN(latNum) && !isNaN(lngNum)) {
+        resolvedLat = latNum;
+        resolvedLng = lngNum;
+        statusMsg = `✓ คำนวณอัตโนมัติจากพิกัดที่กำหนด (${allValid.length} จุด)`;
+      } else {
+        statusMsg = 'กรุณากรอก Latitude และ Longitude ให้ครบ';
+      }
     }
 
-    const calculateStats = (source: string) => {
-      const data = histArr.filter(d => d.source === source);
-      if (data.length === 0) return defaultStats;
-
-      const errors = data.map(d => haversine(lat, lng, d.latitude, d.longitude));
-      const mean = errors.reduce((a,b) => a+b, 0) / errors.length;
-      const stdDev = Math.sqrt(errors.reduce((sq, n) => sq + Math.pow(n - mean, 2), 0) / errors.length);
-      const max = Math.max(...errors);
-      const min = Math.min(...errors);
-      const validAccs = data.filter(d => d.accuracy !== null).map(d => d.accuracy as number);
-      const avgAcc = validAccs.length > 0 ? (validAccs.reduce((a,b) => a+b, 0) / validAccs.length) : '-';
-
+    if (resolvedLat === null || resolvedLng === null) {
       return {
-        samples: data.length,
-        meanError: parseFloat(mean.toFixed(2)),
-        stdDev: parseFloat(stdDev.toFixed(2)),
-        min: parseFloat(min.toFixed(2)),
-        max: parseFloat(max.toFixed(2)),
-        avgAcc: typeof avgAcc === 'number' ? parseFloat(avgAcc.toFixed(2)) : avgAcc,
-        barWidth: 0
+        displayLat: refMode === 'manual' ? refLat : '',
+        displayLng: refMode === 'manual' ? refLng : '',
+        statusMsg,
+        browserStats: DEFAULT_ANALYSIS_STATS,
+        traccarStats: DEFAULT_ANALYSIS_STATS,
+        iotStats: DEFAULT_ANALYSIS_STATS,
+        nativeStats: DEFAULT_ANALYSIS_STATS,
+        deviceRows: [] as DeviceAnalysisRow[],
+        bestSummary: null as { label: string; meanError: number; samples: number } | null
       };
+    }
+
+    const getSourcePoints = (source: string) => {
+      const fromHist = validHist.filter(d => d.source === source);
+      return fromHist.length > 0 ? fromHist : validLive.filter(d => d.source === source);
     };
 
-    const bs = calculateStats('browser');
-    const ts = calculateStats('traccar');
-    const is = calculateStats('iot');
-    const ns = calculateStats('native');
-    
-    // Normalize barWidth relative to max error
+    const bs = computeStatsForPoints(getSourcePoints('browser'), resolvedLat, resolvedLng);
+    const ts = computeStatsForPoints(getSourcePoints('traccar'), resolvedLat, resolvedLng);
+    const is = computeStatsForPoints(getSourcePoints('iot'), resolvedLat, resolvedLng);
+    const ns = computeStatsForPoints(getSourcePoints('native'), resolvedLat, resolvedLng);
+
     const maxGlobalError = Math.max(
-      (bs.meanError as number) || 0, 
-      (ts.meanError as number) || 0, 
-      (is.meanError as number) || 0,
-      (ns.meanError as number) || 0
+      typeof bs.meanError === 'number' ? bs.meanError : 0,
+      typeof ts.meanError === 'number' ? ts.meanError : 0,
+      typeof is.meanError === 'number' ? is.meanError : 0,
+      typeof ns.meanError === 'number' ? ns.meanError : 0
     );
-    
     if (maxGlobalError > 0) {
       if (typeof bs.meanError === 'number') bs.barWidth = Math.min(100, (bs.meanError / maxGlobalError) * 100);
       if (typeof ts.meanError === 'number') ts.barWidth = Math.min(100, (ts.meanError / maxGlobalError) * 100);
@@ -491,11 +575,86 @@ export default function Dashboard() {
       if (typeof ns.meanError === 'number') ns.barWidth = Math.min(100, (ns.meanError / maxGlobalError) * 100);
     }
 
-    setBrowserStats(bs);
-    setTraccarStats(ts);
-    setIotStats(is);
-    setNativeStats(ns);
-    setRefStatus(`✓ คำนวณสำเร็จจาก ${histArr.length} จุด`);
+    const byDevice = new Map<string, Position[]>();
+    validHist.forEach(p => {
+      const list = byDevice.get(p.device_id) || [];
+      list.push(p);
+      byDevice.set(p.device_id, list);
+    });
+    validLive.forEach(p => {
+      if (!byDevice.has(p.device_id)) {
+        byDevice.set(p.device_id, [p]);
+      }
+    });
+
+    const deviceRows: DeviceAnalysisRow[] = Array.from(byDevice.entries())
+      .map(([deviceId, pts]) => {
+        const st = computeStatsForPoints(pts, resolvedLat!, resolvedLng!);
+        return {
+          deviceId,
+          source: pts[0]?.source || 'unknown',
+          samples: Number(st.samples) || 0,
+          meanError: typeof st.meanError === 'number' ? st.meanError : 0,
+          stdDev: typeof st.stdDev === 'number' ? st.stdDev : 0,
+          min: typeof st.min === 'number' ? st.min : 0,
+          max: typeof st.max === 'number' ? st.max : 0,
+          avgAcc: st.avgAcc
+        };
+      })
+      .filter(r => r.samples > 0)
+      .sort((a, b) => a.meanError - b.meanError);
+
+    const sourceCandidates = [
+      { label: 'Native (Android)', stats: ns },
+      { label: 'Browser', stats: bs },
+      { label: 'Traccar', stats: ts },
+      { label: 'IoT (ESP32)', stats: is }
+    ]
+      .filter(c => typeof c.stats.meanError === 'number' && typeof c.stats.samples === 'number' && c.stats.samples > 0)
+      .sort((a, b) => (a.stats.meanError as number) - (b.stats.meanError as number));
+
+    const bestSummary =
+      deviceRows.length > 0
+        ? { label: deviceRows[0].deviceId, meanError: deviceRows[0].meanError, samples: deviceRows[0].samples }
+        : sourceCandidates.length > 0
+        ? {
+            label: sourceCandidates[0].label,
+            meanError: sourceCandidates[0].stats.meanError as number,
+            samples: sourceCandidates[0].stats.samples as number
+          }
+        : null;
+
+    return {
+      displayLat: refMode === 'manual' ? refLat : resolvedLat.toFixed(6),
+      displayLng: refMode === 'manual' ? refLng : resolvedLng.toFixed(6),
+      statusMsg,
+      browserStats: bs,
+      traccarStats: ts,
+      iotStats: is,
+      nativeStats: ns,
+      deviceRows,
+      bestSummary
+    };
+  }, [analysisTick, refMode, refDeviceId, refLat, refLng, gpsPosition, histArr, liveValues, deviceOptions]);
+
+  // Analysis Handlers
+  const handleSetRefFromGPS = () => {
+    setRefMode('gps');
+    if (!browserGpsActive) {
+      startGPS();
+      setGpsOn(true);
+    }
+  };
+
+  const handleRunAnalysis = () => {
+    setAnalysisTick(t => t + 1);
+  };
+
+  const handleResetAnalysis = () => {
+    setRefMode('centroid');
+    setRefDeviceId('');
+    setRefLat('');
+    setRefLng('');
   };
 
   const handleExportCSV = () => {
@@ -526,33 +685,17 @@ export default function Dashboard() {
     a.click();
   };
 
-  const handleResetAnalysis = () => {
-    setRefLat('');
-    setRefLng('');
-    setRefStatus('ไม่ได้ตั้งค่า');
-    setBrowserStats(defaultStats);
-    setTraccarStats(defaultStats);
-    setIotStats(defaultStats);
-    setNativeStats(defaultStats);
+  const handleToggleAnalysis = () => {
+    setIsAnalysisOpen(prev => {
+      const next = !prev;
+      if (next) {
+        setTimeout(() => {
+          document.getElementById('analysis')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        }, 60);
+      }
+      return next;
+    });
   };
-
-  // Data processing
-  const liveValues = Object.values(livePos);
-  const filteredLive = liveValues.filter(p => (filter.src === 'all' || p.source === filter.src) && (filter.dev === 'all' || p.device_id === filter.dev));
-  const filteredHist = histArr.filter(p => (filter.src === 'all' || p.source === filter.src) && (filter.dev === 'all' || p.device_id === filter.dev));
-
-  const stats = {
-    all: liveValues.length,
-    native: liveValues.filter(p => p.source === 'native').length,
-    browser: liveValues.filter(p => p.source === 'browser').length,
-    iot: liveValues.filter(p => p.source === 'iot').length,
-    traccar: liveValues.filter(p => p.source === 'traccar').length
-  };
-
-  const deviceOptions = Array.from(new Set([
-    ...liveValues.map((p: any) => p.device_id),
-    ...histArr.map((p: any) => p.device_id)
-  ])).filter(Boolean);
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -578,7 +721,7 @@ export default function Dashboard() {
         deviceOptions={deviceOptions}
         onExport={handleExportCSV}
         onClear={handleClear}
-        onToggleAnalysis={() => setIsAnalysisOpen(true)}
+        onToggleAnalysis={handleToggleAnalysis}
       />
 
       <MapArea stats={stats} theme={theme} liveData={filteredLive as any} historyData={filteredHist as any} clearSignal={clearSignal} />
@@ -592,13 +735,28 @@ export default function Dashboard() {
         onRunAnalysis={handleRunAnalysis}
         onExportCSV={handleExportCSV}
         onReset={handleResetAnalysis}
-        refLat={refLat} refLng={refLng} 
-        onRefLatChange={setRefLat} onRefLngChange={setRefLng}
-        refStatus={refStatus}
-        browserStats={browserStats}
-        iotStats={iotStats}
-        traccarStats={traccarStats}
-        nativeStats={nativeStats}
+        refMode={refMode}
+        onRefModeChange={(mode) => {
+          if (mode === 'manual' && refMode !== 'manual') {
+            setRefLat(autoAnalysis.displayLat);
+            setRefLng(autoAnalysis.displayLng);
+          }
+          setRefMode(mode);
+        }}
+        refDeviceId={refDeviceId || deviceOptions[0] || ''}
+        onRefDeviceIdChange={setRefDeviceId}
+        deviceOptions={deviceOptions}
+        refLat={autoAnalysis.displayLat}
+        refLng={autoAnalysis.displayLng}
+        onRefLatChange={setRefLat}
+        onRefLngChange={setRefLng}
+        refStatus={autoAnalysis.statusMsg}
+        browserStats={autoAnalysis.browserStats}
+        iotStats={autoAnalysis.iotStats}
+        traccarStats={autoAnalysis.traccarStats}
+        nativeStats={autoAnalysis.nativeStats}
+        deviceRows={autoAnalysis.deviceRows}
+        bestSummary={autoAnalysis.bestSummary}
       />
     </div>
   );

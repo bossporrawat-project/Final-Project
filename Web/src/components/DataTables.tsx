@@ -53,12 +53,45 @@ function formatAgeLabel(ageSec: number): string {
 
 export default function DataTables({ liveData, historyData }: DataTablesProps) {
   const [nowMs, setNowMs] = useState<number>(0);
+  const [selectedBySlot, setSelectedBySlot] = useState<Record<string, string>>({});
 
   useEffect(() => {
     setNowMs(Date.now());
+    try {
+      const saved = localStorage.getItem('omni_compare_slots');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed && typeof parsed === 'object') setSelectedBySlot(parsed);
+      }
+    } catch {}
     const timer = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(timer);
   }, []);
+
+  const handleSelectSlotDevice = (slotKey: string, deviceId: string) => {
+    setSelectedBySlot(prev => {
+      const next = { ...prev };
+      if (!deviceId || deviceId === '__auto__') {
+        delete next[slotKey];
+      } else {
+        next[slotKey] = deviceId;
+      }
+      try {
+        localStorage.setItem('omni_compare_slots', JSON.stringify(next));
+      } catch {}
+      return next;
+    });
+  };
+
+  const handleResetCompareSlots = () => {
+    setSelectedBySlot({});
+    try {
+      localStorage.removeItem('omni_compare_slots');
+    } catch {}
+  };
+
+  const sortedAllLive = [...liveData].sort((a, b) => getFreshnessMs(b) - getFreshnessMs(a));
+  const hasCustomSelection = Object.keys(selectedBySlot).length > 0;
   
   const getSourceIcon = (source: string) => {
     switch(source) {
@@ -99,12 +132,26 @@ export default function DataTables({ liveData, historyData }: DataTablesProps) {
     }
   };
 
-  const renderColumn = (source: string, title: string, headerClass: string) => {
-    // Pick the most recently updated device with valid coordinates for this source
-    const sourceData = liveData
-      .filter(d => d.source === source)
-      .sort((a, b) => getFreshnessMs(b) - getFreshnessMs(a));
-    const latest = sourceData.find(d => d.latitude !== 0 && d.longitude !== 0) || sourceData[0] || null;
+  const getHeaderClass = (source: string) => {
+    switch (source) {
+      case 'native': return 'ch-native';
+      case 'browser': return 'ch-browser';
+      case 'traccar': return 'ch-traccar';
+      case 'iot': return 'ch-iot';
+      default: return 'ch-browser';
+    }
+  };
+
+  const renderColumn = (source: string, title: string, defaultHeaderClass: string) => {
+    const selectedId = selectedBySlot[source] || '__auto__';
+    const sameSourceDevices = sortedAllLive.filter(d => d.source === source);
+    const otherDevices = sortedAllLive.filter(d => d.source !== source);
+    const autoLatest = sameSourceDevices.find(d => d.latitude !== 0 && d.longitude !== 0) || sameSourceDevices[0] || null;
+    const manualMatch = selectedId !== '__auto__' ? sortedAllLive.find(d => d.device_id === selectedId) || null : null;
+    const latest = manualMatch || autoLatest;
+
+    const activeSource = latest?.source || source;
+    const headerClass = manualMatch ? getHeaderClass(activeSource) : defaultHeaderClass;
     const rawTime = latest ? (latest.device_time || latest.timestamp || latest.updated_at || latest.recorded_at || '') : '';
     const freshMs = latest ? getFreshnessMs(latest) : 0;
     const ageSec = nowMs > 0 && freshMs > 0 ? Math.max(0, Math.floor((nowMs - freshMs) / 1000)) : null;
@@ -115,8 +162,8 @@ export default function DataTables({ liveData, historyData }: DataTablesProps) {
       <div className="comp-col">
         <div className={`comp-hdr ${headerClass} flex items-center justify-between gap-2`}>
           <div className="flex items-center gap-2 min-w-0">
-            {getSourceIcon(source)}
-            <span className="truncate">{title}</span>
+            {getSourceIcon(activeSource)}
+            <span className="truncate">{manualMatch ? (manualMatch.device_name || manualMatch.device_id) : title}</span>
           </div>
           {latest && ageSec !== null && (
             <span
@@ -137,10 +184,40 @@ export default function DataTables({ liveData, historyData }: DataTablesProps) {
             </span>
           )}
         </div>
+        <div className="px-3 py-2 bg-[var(--bg-secondary)]/60 border-b border-[var(--border)] flex items-center gap-2">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-3)] shrink-0">Device:</span>
+          <select
+            aria-label={`Select comparison device for ${title}`}
+            className="w-full text-xs bg-[var(--bg-primary)] text-[var(--text-1)] border border-[var(--border)] rounded px-2 py-1 focus:outline-none focus:border-[var(--cyan)]"
+            value={selectedId}
+            onChange={(e) => handleSelectSlotDevice(source, e.target.value)}
+          >
+            <option value="__auto__">Auto ({title} ล่าสุด)</option>
+            {sameSourceDevices.length > 0 && (
+              <optgroup label={`ในกลุ่ม ${title}`}>
+                {sameSourceDevices.map(d => (
+                  <option key={d.device_id} value={d.device_id}>
+                    {d.device_name || d.device_id}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+            {otherDevices.length > 0 && (
+              <optgroup label="Devices อื่นๆ (เทียบข้ามกลุ่มได้)">
+                {otherDevices.map(d => (
+                  <option key={d.device_id} value={d.device_id}>
+                    {d.device_name || d.device_id} [{d.source}]
+                  </option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+        </div>
         <div className="comp-body">
           {latest ? (
             <>
               {renderDataRow('Device', latest.device_name || latest.device_id)}
+              {renderDataRow('Source', latest.source.toUpperCase())}
               {renderDataRow(
                 'Status',
                 latest.app_status || (isLiveNow ? 'LIVE (Real-time)' : 'Tracking Active'),
@@ -167,11 +244,22 @@ export default function DataTables({ liveData, historyData }: DataTablesProps) {
   return (
     <div id="dsec">
       <div>
-        <div className="dsec-header flex justify-between items-center">
+        <div className="dsec-header flex flex-wrap justify-between items-center gap-2">
           <span>Live Tracking Comparison</span>
-          <span className="text-sm font-normal text-[var(--text-3)] bg-[var(--bg-secondary)] px-3 py-1 rounded-full border border-[var(--border)]">
-            Total Live Points: {liveData.length}
-          </span>
+          <div className="flex items-center gap-2">
+            {hasCustomSelection && (
+              <button
+                type="button"
+                onClick={handleResetCompareSlots}
+                className="text-xs font-medium text-[var(--cyan)] bg-[var(--bg-secondary)] hover:bg-[var(--bg-card-hover)] px-3 py-1 rounded-full border border-[var(--border)] transition-colors"
+              >
+                ↺ รีเซ็ตเป็น Auto ทั้งหมด
+              </button>
+            )}
+            <span className="text-sm font-normal text-[var(--text-3)] bg-[var(--bg-secondary)] px-3 py-1 rounded-full border border-[var(--border)]">
+              Total Live Points: {liveData.length}
+            </span>
+          </div>
         </div>
         <div className="comp-grid mt-4" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
           {renderColumn('native', 'Native (Android)', 'ch-native')}
