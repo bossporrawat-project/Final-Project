@@ -1,15 +1,17 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { Locate, Activity, Cpu } from 'lucide-react';
 
 export interface PositionData {
   id: string;
   source: string; // 'browser', 'iot', 'traccar', 'native'
   device_id: string;
+  device_name?: string;
   latitude: number;
   longitude: number;
   speed: number;
   accuracy: number | null;
   app_status?: string | null;
+  is_online?: boolean;
   timestamp?: string;
   updated_at?: string;
   recorded_at?: string;
@@ -23,7 +25,40 @@ interface DataTablesProps {
   historyData: PositionData[];
 }
 
+function getTimestampMs(raw?: string): number {
+  if (!raw) return 0;
+  const ms = new Date(raw).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function getFreshnessMs(item: PositionData): number {
+  return (
+    getTimestampMs(item.updated_at) ||
+    getTimestampMs(item.server_time) ||
+    getTimestampMs(item.device_time) ||
+    getTimestampMs(item.recorded_at) ||
+    getTimestampMs(item.timestamp)
+  );
+}
+
+function formatAgeLabel(ageSec: number): string {
+  if (ageSec < 0) ageSec = 0;
+  if (ageSec < 60) return `${ageSec}s`;
+  const mins = Math.floor(ageSec / 60);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h`;
+  return `${Math.floor(hrs / 24)}d`;
+}
+
 export default function DataTables({ liveData, historyData }: DataTablesProps) {
+  const [nowMs, setNowMs] = useState<number>(0);
+
+  useEffect(() => {
+    setNowMs(Date.now());
+    const timer = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
   
   const getSourceIcon = (source: string) => {
     switch(source) {
@@ -65,22 +100,52 @@ export default function DataTables({ liveData, historyData }: DataTablesProps) {
   };
 
   const renderColumn = (source: string, title: string, headerClass: string) => {
-    // Prefer a device with active non-zero coordinates, falling back to the first entry
-    const sourceData = liveData.filter(d => d.source === source);
+    // Pick the most recently updated device with valid coordinates for this source
+    const sourceData = liveData
+      .filter(d => d.source === source)
+      .sort((a, b) => getFreshnessMs(b) - getFreshnessMs(a));
     const latest = sourceData.find(d => d.latitude !== 0 && d.longitude !== 0) || sourceData[0] || null;
     const rawTime = latest ? (latest.device_time || latest.timestamp || latest.updated_at || latest.recorded_at || '') : '';
+    const freshMs = latest ? getFreshnessMs(latest) : 0;
+    const ageSec = nowMs > 0 && freshMs > 0 ? Math.max(0, Math.floor((nowMs - freshMs) / 1000)) : null;
+    const isLiveNow = ageSec !== null && ageSec <= 15;
+    const isRecent = ageSec !== null && ageSec <= 120;
 
     return (
       <div className="comp-col">
-        <div className={`comp-hdr ${headerClass}`}>
-          {getSourceIcon(source)}
-          {title}
+        <div className={`comp-hdr ${headerClass} flex items-center justify-between gap-2`}>
+          <div className="flex items-center gap-2 min-w-0">
+            {getSourceIcon(source)}
+            <span className="truncate">{title}</span>
+          </div>
+          {latest && ageSec !== null && (
+            <span
+              className={`shrink-0 text-[10px] font-bold px-2 py-0.5 rounded-full border flex items-center gap-1 ${
+                isLiveNow
+                  ? 'bg-emerald-500/15 text-emerald-400 border-emerald-500/40'
+                  : isRecent
+                  ? 'bg-amber-500/15 text-amber-400 border-amber-500/40'
+                  : 'bg-slate-500/10 text-[var(--text-3)] border-[var(--border)]'
+              }`}
+            >
+              <span
+                className={`w-1.5 h-1.5 rounded-full ${
+                  isLiveNow ? 'bg-emerald-400 animate-pulse' : isRecent ? 'bg-amber-400' : 'bg-slate-400'
+                }`}
+              />
+              {isLiveNow ? `LIVE ${ageSec}s` : `${formatAgeLabel(ageSec)} ago`}
+            </span>
+          )}
         </div>
         <div className="comp-body">
           {latest ? (
             <>
-              {renderDataRow('Device', latest.device_id)}
-              {renderDataRow('Status', latest.app_status || 'Tracking Active', true)}
+              {renderDataRow('Device', latest.device_name || latest.device_id)}
+              {renderDataRow(
+                'Status',
+                latest.app_status || (isLiveNow ? 'LIVE (Real-time)' : 'Tracking Active'),
+                true
+              )}
               {renderDataRow('Latitude', latest.latitude ? latest.latitude.toFixed(6) : '—')}
               {renderDataRow('Longitude', latest.longitude ? latest.longitude.toFixed(6) : '—')}
               {renderDataRow('Speed (km/h)', Number(latest.speed || 0).toFixed(1))}

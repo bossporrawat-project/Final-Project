@@ -38,6 +38,7 @@ export default function Dashboard() {
   const lastHistoryRecordRef = useRef<{ lat: number; lng: number; time: number } | null>(null);
   const lastTraccarRecordRef = useRef<Record<string, { lat: number; lng: number; time: number }>>({});
   const lastIoTRecordRef = useRef<Record<string, { lat: number; lng: number; timeStr: string; time: number }>>({});
+  const livePollRef = useRef<NodeJS.Timeout | null>(null);
 
   // States from hooks
   const { livePos, setLivePos } = useLivePositions();
@@ -95,25 +96,63 @@ export default function Dashboard() {
     setMyDevice(name || 'ESP32_Tracker');
     initializeSupabase(url, key);
     if (token) connectTraccar(token);
+
+    return () => {
+      if (livePollRef.current) {
+        clearInterval(livePollRef.current);
+        livePollRef.current = null;
+      }
+    };
   }, []);
 
   const initializeSupabase = async (url: string, key: string) => {
     try {
+      if (livePollRef.current) {
+        clearInterval(livePollRef.current);
+        livePollRef.current = null;
+      }
+
       const client = getSupabaseClient(url, key);
       setSupabase(client);
       setSupaStatus(true);
-      // Fetch initial data (preserve all history records up to 10,000 rows)
-      const { data: liveData } = await client.from('gps_positions').select('*').order('device_time', { ascending: false });
-      const { data: historyData } = await client.from('gps_history').select('*').order('device_time', { ascending: false }).limit(10000);
+      // Fetch initial data ordered by actual server arrival time so skewed device clocks don't bury live records
+      const { data: liveData } = await client
+        .from('gps_positions')
+        .select('*')
+        .order('updated_at', { ascending: false, nullsFirst: false });
+      const { data: historyData } = await client
+        .from('gps_history')
+        .select('*')
+        .order('server_time', { ascending: false, nullsFirst: false })
+        .limit(10000);
       
+      const lastSeenSigByDev: Record<string, string> = {};
       if (liveData) {
         const liveMap: Record<string, any> = {};
-        liveData.forEach((r: any) => liveMap[r.device_id] = r);
+        liveData.forEach((r: any) => {
+          liveMap[r.device_id] = r;
+          lastSeenSigByDev[r.device_id] = `${r.updated_at || ''}|${r.device_time || ''}|${r.latitude}|${r.longitude}|${r.speed}`;
+        });
         setLivePos(liveMap);
       }
       if (historyData) setHistArr(historyData);
 
       client.removeAllChannels();
+
+      const applyIncomingLiveRow = (r: any) => {
+        if (!r || !r.device_id) return;
+        const sig = `${r.updated_at || ''}|${r.device_time || ''}|${r.latitude}|${r.longitude}|${r.speed}`;
+        if (lastSeenSigByDev[r.device_id] === sig) return;
+        lastSeenSigByDev[r.device_id] = sig;
+
+        setLivePos(prev => ({ ...prev, [r.device_id]: r }));
+        if (r.latitude !== 0 || r.longitude !== 0) {
+          appendHistoryPoint({
+            ...r,
+            id: `${r.device_id}_${r.device_time || r.updated_at}_${r.latitude}_${r.longitude}`
+          });
+        }
+      };
 
       // Subscribe to realtime (never delete old points automatically; only on Clear)
       client.channel('live-pos')
@@ -121,22 +160,32 @@ export default function Dashboard() {
           if (payload.eventType === 'DELETE') {
             return;
           }
-          const r = payload.new;
-          if (r && r.device_id) {
-            setLivePos(prev => ({ ...prev, [r.device_id]: r }));
-            if (r.latitude !== 0 || r.longitude !== 0) {
-              appendHistoryPoint({
-                ...r,
-                id: `${r.device_id}_${r.device_time || r.updated_at}_${r.latitude}_${r.longitude}`
-              });
-            }
-          }
-        }).subscribe();
+          applyIncomingLiveRow(payload.new);
+        })
+        .subscribe((status) => {
+          if (status === 'SUBSCRIBED') setSupaStatus(true);
+          else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setSupaStatus(false);
+        });
         
       client.channel('hist-log')
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'gps_history' }, (payload: any) => {
           appendHistoryPoint(payload.new);
         }).subscribe();
+
+      // Resilient polling fallback so Live Tracking Comparison stays real-time even if WebSocket stalls
+      livePollRef.current = setInterval(async () => {
+        try {
+          const { data: latestRows, error } = await client
+            .from('gps_positions')
+            .select('*')
+            .order('updated_at', { ascending: false, nullsFirst: false });
+          if (!error && Array.isArray(latestRows)) {
+            latestRows.forEach(applyIncomingLiveRow);
+          }
+        } catch {
+          // Ignore transient network hiccups during background polling
+        }
+      }, 2500);
         
     } catch (err) {
       console.error(err);
@@ -153,12 +202,31 @@ export default function Dashboard() {
     }
   };
 
-  // Sync GPS to Supabase (Throttled to avoid flooding identical stationary coordinates)
+  // Sync GPS to live view immediately & persist to Supabase when tracking is active
   useEffect(() => {
-    if (gpsPosition && supabase && isTrack) {
-      const now = new Date().toISOString();
-      const devTime = gpsPosition.timestamp || now;
-      
+    if (!gpsPosition) return;
+    const now = new Date().toISOString();
+    const devTime = gpsPosition.timestamp || now;
+
+    // Update Browser card & map immediately without waiting for Supabase Realtime round-trip
+    setLivePos(prev => ({
+      ...prev,
+      [myDevice]: {
+        device_id: myDevice,
+        device_name: myDevice,
+        latitude: gpsPosition.latitude,
+        longitude: gpsPosition.longitude,
+        speed: gpsPosition.speed,
+        accuracy: gpsPosition.accuracy,
+        source: 'browser',
+        is_online: true,
+        device_time: devTime,
+        server_time: now,
+        updated_at: now
+      }
+    }));
+
+    if (supabase && isTrack) {
       // 1. Always update live position heartbeat
       supabase.from('gps_positions').upsert({
         device_id: myDevice, device_name: myDevice,
@@ -196,7 +264,7 @@ export default function Dashboard() {
         });
       }
     }
-  }, [gpsPosition, supabase, isTrack, myDevice, appendHistoryPoint]);
+  }, [gpsPosition, supabase, isTrack, myDevice, appendHistoryPoint, setLivePos]);
 
   // Sync Traccar positions to live view and Supabase
   useEffect(() => {
