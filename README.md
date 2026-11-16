@@ -61,8 +61,91 @@ flowchart LR
 
 ระบบใช้ตารางหลัก **2 ตาราง** และออกแบบให้รองรับ **Dual-Timestamp** เพื่อแยกเวลาที่เกิดขึ้นจริงบนอุปกรณ์ (`device_time`) ออกจากเวลาที่เซิร์ฟเวอร์ได้รับ (`server_time`) พร้อมกลไกป้องกันข้อมูลค้างคิวเก่ามาเขียนทับพิกัดล่าสุด:
 
-1. **`public.gps_positions`** — เก็บ **ตำแหน่งล่าสุด 1 แถวต่อ 1 อุปกรณ์** (`device_id UNIQUE`) ใช้แสดงบนแผนที่ Realtime และการ์ด Live Tracking Comparison
-2. **`public.gps_history`** — เก็บ **ประวัติพิกัดทุกจุดตามลำดับเวลา** ใช้สร้างเส้นทางเดินรถ, Export CSV, และคำนวณสถิติใน Analysis
+```mermaid
+erDiagram
+    gps_history ||--o| gps_positions : "trg_sync_gps_positions (Queue-Safe Sync)"
+    gps_positions {
+        uuid id PK
+        text device_id UK "1 แถวต่อ 1 อุปกรณ์"
+        text device_name
+        double latitude
+        double longitude
+        double speed
+        double accuracy
+        text source "native | browser | traccar | iot"
+        text app_status
+        boolean is_online
+        timestamptz device_time
+        timestamptz server_time
+        timestamptz updated_at
+    }
+    gps_history {
+        uuid id PK
+        text device_id
+        double latitude
+        double longitude
+        double speed
+        double accuracy
+        text source "native | browser | traccar | iot"
+        timestamptz device_time "Unique ร่วมกับ device_id"
+        timestamptz server_time
+        timestamptz recorded_at "รองรับแอป Android"
+    }
+```
+
+### คำอธิบายตารางที่ 1: `public.gps_positions` (ตำแหน่งล่าสุด / Live Tracking State)
+* **หน้าที่หลัก:** เก็บพิกัดปัจจุบันล่าสุดของแต่ละอุปกรณ์เพียง **1 แถวต่อ 1 เครื่อง** (ใช้ `device_id` เป็น Unique Key สำหรับทำ `UPSERT`)
+* **การทำงานร่วมกับ UI:** ใช้แสดงหมุดตำแหน่งปัจจุบันบนแผนที่, ตัวเลขสถานะมุมขวาบนแผนที่, และการ์ด **Live Tracking Comparison** (อัปเดตสดผ่าน Supabase Realtime `postgres_changes` + Polling Fallback ทุก 2.5 วินาที)
+
+| คอลัมน์ | ชนิดข้อมูล | Constraint / Default | คำอธิบายและการใช้งานจริง |
+| --- | --- | --- | --- |
+| `id` | `UUID` | `PRIMARY KEY`, `gen_random_uuid()` | รหัสอ้างอิงเฉพาะของแถว |
+| `device_id` | `TEXT` | `UNIQUE NOT NULL` | รหัส/ชื่อเฉพาะของอุปกรณ์ เช่น `Boss Phone native app`, `PC COM Browser`, `ESP32_001`, `Traccar_98615` ใช้เป็น Key สำหรับ `onConflict=device_id` |
+| `device_name` | `TEXT` | — | ชื่ออุปกรณ์ที่แสดงผลบน UI (หากไม่มีจะ Fallback ไปใช้ `device_id`) |
+| `latitude` | `DOUBLE PRECISION` | `NOT NULL` | ค่าละติจูดล่าสุด (องศาทศนิยม) |
+| `longitude` | `DOUBLE PRECISION` | `NOT NULL` | ค่าลองจิจูดล่าสุด (องศาทศนิยม) |
+| `speed` | `DOUBLE PRECISION` | `DEFAULT 0` | ความเร็วปัจจุบันหน่วย **km/h** (Browser/Android แปลงจาก `m/s × 3.6`, Traccar แปลงจาก `knots × 1.852`) |
+| `accuracy` | `DOUBLE PRECISION` | Nullable | ค่าความคลาดเคลื่อนที่อุปกรณ์รายงาน (เมตร) |
+| `source` | `TEXT` | Nullable | แหล่งที่มาของข้อมูล: `native`, `browser`, `traccar`, หรือ `iot` (กำหนดสีและหมวดหมู่บนแผนที่) |
+| `app_status` | `TEXT` | `DEFAULT 'Tracking Active'` | สถานะการทำงานของแอป/อุปกรณ์ เช่น `Tracking Active`, `Stopped` |
+| `is_online` | `BOOLEAN` | `DEFAULT true` | Flag ระบุว่าอุปกรณ์ส่งข้อมูลออนไลน์อยู่หรือไม่ |
+| `device_time` | `TIMESTAMPTZ` | `DEFAULT NOW()` | เวลาจริงจากชิป GPS / นาฬิกาอุปกรณ์ ณ จุดที่จับพิกัด |
+| `server_time` | `TIMESTAMPTZ` | `DEFAULT NOW()` | เวลาที่ฐานข้อมูล Supabase ได้รับข้อมูลจริง |
+| `updated_at` | `TIMESTAMPTZ` | `DEFAULT NOW()` | เวลาอัปเดตแถวล่าสุด ใช้จัดเรียงหาเครื่องที่สดที่สุดใน Live Tracking Comparison (`LIVE Xs`) |
+
+---
+
+### คำอธิบายตารางที่ 2: `public.gps_history` (ประวัติพิกัดย้อนหลัง / Time-Series Log)
+* **หน้าที่หลัก:** เก็บประวัติการเคลื่อนที่ทุกจุดแบบ Time-Series (Append-only) เพื่อรองรับข้อมูลสะสมระดับหลายหมื่นถึงหลายล้านแถว
+* **การทำงานร่วมกับระบบ:**
+  * ใช้ดึงข้อมูลไปวาดเส้นทาง (Polyline) และลูกศรบอกทิศทางบนแผนที่ (`get_route_decimated`)
+  * แสดงผลในตาราง **History Log** แบบแบ่งหน้า Server-Side ทีละ 50 แถว (`.range()`)
+  * ใช้วิเคราะห์ความแม่นยำใน **Accuracy Analysis** (`get_accuracy_analysis`) และ **Export CSV**
+  * เมื่อมีแถวใหม่ `INSERT` เข้าตารางนี้ Trigger `trg_sync_gps_positions` จะอัปเดตไปยัง `gps_positions` ให้อัตโนมัติเฉพาะเมื่อ `device_time` ใหม่กว่าหรือเท่ากับค่าเดิม (**Out-of-Order Overwrite Protection**)
+
+| คอลัมน์ | ชนิดข้อมูล | Constraint / Default | คำอธิบายและการใช้งานจริง |
+| --- | --- | --- | --- |
+| `id` | `UUID` | `PRIMARY KEY`, `gen_random_uuid()` | รหัสอ้างอิงเฉพาะของจุดประวัติ ใช้เป็น React Key และ Deduplication Key (`O(1)`) |
+| `device_id` | `TEXT` | `NOT NULL` | รหัสอุปกรณ์เจ้าของพิกัด จับคู่สร้าง Index ร่วมกับเวลา |
+| `latitude` | `DOUBLE PRECISION` | `NOT NULL` | ค่าละติจูดของจุดประวัติ (ระบบตัดค่า `0, 0` ออกตอนวาดแผนที่และวิเคราะห์) |
+| `longitude` | `DOUBLE PRECISION` | `NOT NULL` | ค่าลองจิจูดของจุดประวัติ |
+| `speed` | `DOUBLE PRECISION` | `DEFAULT 0` | ความเร็ว ณ เวลานั้น (km/h) |
+| `accuracy` | `DOUBLE PRECISION` | Nullable | ค่า Accuracy ณ จุดนั้น (เมตร) ใช้คำนวณ `Avg Acc` ใน Analysis |
+| `source` | `TEXT` | Nullable | แหล่งที่มา: `native`, `browser`, `traccar`, หรือ `iot` |
+| `device_time` | `TIMESTAMPTZ` | `DEFAULT NOW()`, `UNIQUE(device_id, device_time)` | เวลาจริงของอุปกรณ์ ใช้เรียงลำดับจุดเดินรถ (`ASC`) และทำ Idempotency ป้องกันคิวส่งซ้ำ (`onConflict=device_id,device_time`) |
+| `server_time` | `TIMESTAMPTZ` | `DEFAULT NOW()` | เวลาฝั่งเซิร์ฟเวอร์ ใช้เรียงลำดับรายการล่าสุดใน History Log (`DESC`) โดยไม่ได้รับผลกระทบหากนาฬิกาอุปกรณ์เพี้ยน |
+| `recorded_at` | `TIMESTAMPTZ` | Nullable | คอลัมน์เวลาเพิ่มเติมที่แอป Android (`SupabaseClient.kt`) ส่งมาด้วย ระบบหน้าเว็บและ Trigger รองรับ Fallback ให้อัตโนมัติ |
+
+### สรุปการใช้งานตารางในแต่ละส่วนของระบบ
+
+| ส่วนประกอบของระบบ | ตารางที่เขียน (`Write`) | ตารางที่อ่าน (`Read / Subscribe`) | หมายเหตุ |
+| --- | --- | --- | --- |
+| **Android Native App** | `gps_positions` (Upsert), `gps_history` (Batch Insert) | — | ส่งแบบ Batch ทุก 5 วินาที |
+| **Web Browser GPS** | `gps_positions` (Upsert), `gps_history` (Insert เมื่อ >3m หรือ >30s) | — | อัปเดต State หน้าเว็บทันทีแบบ Optimistic |
+| **Traccar (WebSocket / Webhook)** | `gps_positions` (Upsert), `gps_history` (Upsert) | — | แปลง Knots → km/h อัตโนมัติ |
+| **IoT ESP32 (SD Queue)** | `gps_history` (Insert ตรง + ซิงก์ Offline Queue) | — | Trigger ซิงก์ไป `gps_positions` อัตโนมัติ |
+| **Web Map & Live Comparison** | — | `gps_positions` (Realtime + Poll 2.5s), `gps_history` (`get_route_decimated`) | ดึงเส้นทางแยกราย Device ไม่โดนตัดที่ 1,000 แถว |
+| **History Log / Export / Analysis** | `gps_positions` & `gps_history` (`DELETE` เฉพาะตอนกด Clear) | `gps_history` (Pagination `.range()`, SQL RPCs) | รองรับฐานข้อมูล 1,000,000+ แถว |
 
 ### SQL Script สำหรับติดตั้งบน Supabase
 
