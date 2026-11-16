@@ -58,3 +58,25 @@ export interface AnalysisStats {
   avgAcc: number | string;
   barWidth: number;
 }
+
+/**
+ * Uniformly decimates an ordered array of points to at most maxPoints while
+ * always preserving the first and last point (so start, end, and route shape stay intact).
+ */
+export function decimatePoints<T>(points: T[], maxPoints: number): T[] {
+  if (maxPoints <= 2 || points.length <= maxPoints) return points;
+  const result: T[] = [points[0]];
+  const interiorTarget = maxPoints - 2;
+  const span = points.length - 2;
+  let lastPickedIdx = 0;
+
+  for (let i = 1; i <= interiorTarget; i++) {
+    const idx = Math.min(points.length - 2, Math.max(1, Math.round((i * span) / (interiorTarget + 1))));
+    if (idx > lastPickedIdx) {
+      result.push(points[idx]);
+      lastPickedIdx = idx;
+    }
+  }
+  result.push(points[points.length - 1]);
+  return result;
+}

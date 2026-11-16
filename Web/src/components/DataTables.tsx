@@ -23,6 +23,11 @@ export interface PositionData {
 interface DataTablesProps {
   liveData: PositionData[];
   historyData: PositionData[];
+  totalHistoryCount?: number;
+  historyPage?: number;
+  historyPageSize?: number;
+  onHistoryPageChange?: (page: number) => void;
+  isHistoryLoading?: boolean;
 }
 
 function getTimestampMs(raw?: string): number {
@@ -51,7 +56,15 @@ function formatAgeLabel(ageSec: number): string {
   return `${Math.floor(hrs / 24)}d`;
 }
 
-export default function DataTables({ liveData, historyData }: DataTablesProps) {
+export default function DataTables({
+  liveData,
+  historyData,
+  totalHistoryCount,
+  historyPage = 1,
+  historyPageSize = 50,
+  onHistoryPageChange,
+  isHistoryLoading = false,
+}: DataTablesProps) {
   const [nowMs, setNowMs] = useState<number>(0);
   const [selectedBySlot, setSelectedBySlot] = useState<Record<string, string>>({});
 
@@ -270,11 +283,36 @@ export default function DataTables({ liveData, historyData }: DataTablesProps) {
       </div>
 
       <div className="mt-8">
-        <div className="dsec-header flex justify-between items-center mb-4">
-          <span>History Log ({historyData.length} records)</span>
+        <div className="dsec-header flex flex-wrap justify-between items-center gap-2 mb-4">
+          <span>
+            History Log ({(totalHistoryCount ?? historyData.length).toLocaleString()} records in DB)
+          </span>
+          {onHistoryPageChange && (totalHistoryCount ?? historyData.length) > historyPageSize && (
+            <div className="flex items-center gap-2 text-xs font-normal">
+              <button
+                type="button"
+                disabled={historyPage <= 1 || isHistoryLoading}
+                onClick={() => onHistoryPageChange(historyPage - 1)}
+                className="px-2.5 py-1 rounded border border-[var(--border)] bg-[var(--bg-secondary)] text-[var(--text-1)] disabled:opacity-40 hover:bg-[var(--bg-card-hover)]"
+              >
+                ← ก่อนหน้า
+              </button>
+              <span className="text-[var(--text-2)] font-inter">
+                หน้า {historyPage.toLocaleString()} / {Math.max(1, Math.ceil((totalHistoryCount ?? historyData.length) / historyPageSize)).toLocaleString()}
+              </span>
+              <button
+                type="button"
+                disabled={historyPage >= Math.ceil((totalHistoryCount ?? historyData.length) / historyPageSize) || isHistoryLoading}
+                onClick={() => onHistoryPageChange(historyPage + 1)}
+                className="px-2.5 py-1 rounded border border-[var(--border)] bg-[var(--bg-secondary)] text-[var(--text-1)] disabled:opacity-40 hover:bg-[var(--bg-card-hover)]"
+              >
+                ถัดไป →
+              </button>
+            </div>
+          )}
         </div>
         <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-[var(--r)] overflow-hidden shadow-[var(--shadow)]">
-          <div className="max-h-[300px] overflow-y-auto">
+          <div className="max-h-[340px] overflow-y-auto">
             <table className="w-full text-sm">
               <thead className="sticky top-0 bg-[var(--bg-primary)] z-10 text-left border-b border-[var(--border)]">
                 <tr>
@@ -288,12 +326,16 @@ export default function DataTables({ liveData, historyData }: DataTablesProps) {
                 </tr>
               </thead>
               <tbody>
-                {historyData.length === 0 ? (
+                {isHistoryLoading ? (
+                  <tr>
+                    <td colSpan={7} className="p-8 text-center text-[var(--text-3)]">กำลังโหลดข้อมูลหน้า {historyPage}...</td>
+                  </tr>
+                ) : historyData.length === 0 ? (
                   <tr>
                     <td colSpan={7} className="p-8 text-center text-[var(--text-3)]">No history records yet.</td>
                   </tr>
                 ) : (
-                  historyData.map((row) => {
+                  historyData.slice(0, historyPageSize).map((row) => {
                     const rawTime = row.device_time || row.timestamp || row.recorded_at || row.updated_at || '';
                     return (
                       <tr key={row.id} className="border-b border-[var(--row-alt)] hover:bg-[var(--bg-card-hover)] transition-colors">

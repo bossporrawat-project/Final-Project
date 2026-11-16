@@ -59,6 +59,9 @@ function computeStatsForPoints(points: Position[], refLatNum: number, refLngNum:
 const DEFAULT_SUPABASE_URL = 'https://ryuhkaytmlapkuumgnlo.supabase.co';
 const DEFAULT_SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ5dWhrYXl0bWxhcGt1dW1nbmxvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE1MzY4MjUsImV4cCI6MjEwNzExMjgyNX0.JYKrvAMK64xE5r92pepQy02fVl4mO55dMaz93heaee8';
 const DEFAULT_TRACCAR_TOKEN = 'RzBFAiEA0r4vWkHt8kbO4UUdUzpnQtp9kt8u-tCZpnGyuiOYnSMCIDdBykoJyep_WQyh3vNAFGJZz9anp4tVp3sJi6vi3mq3eyJpIjo3Mjg1Mzk1MjE3NTUyMDI5NTYxLCJ1IjoxNDg3MTYsImUiOiIyMDMwLTAxLTAxVDAwOjAwOjAwLjAwMCswMDowMCJ9';
+const HISTORY_PAGE_SIZE = 50;
+const MAX_IN_MEMORY_ROUTE_POINTS = 12000;
+const MAX_CSV_EXPORT_ROWS = 100000;
 
 export default function Dashboard() {
   const [isAnalysisOpen, setIsAnalysisOpen] = useState(false);
@@ -91,22 +94,76 @@ export default function Dashboard() {
 
   const [supabase, setSupabase] = useState<any>(null);
   const [clearSignal, setClearSignal] = useState(0);
+  const [totalHistoryCount, setTotalHistoryCount] = useState(0);
+  const [historyPage, setHistoryPage] = useState(1);
+  const [historyPageRows, setHistoryPageRows] = useState<Position[]>([]);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
+  const [serverCentroid, setServerCentroid] = useState<{ total: number; lat: number; lng: number } | null>(null);
+  const [serverDeviceRows, setServerDeviceRows] = useState<DeviceAnalysisRow[] | null>(null);
+  const histKeySetRef = useRef<Set<string>>(new Set());
 
-  const appendHistoryPoint = useCallback((pt: Position) => {
+  const makeHistKey = (pt: Position) => {
+    const ptTime = pt.device_time || pt.recorded_at || pt.updated_at || '';
+    return pt.id
+      ? String(pt.id)
+      : `${pt.device_id}_${ptTime}_${Number(pt.latitude).toFixed(6)}_${Number(pt.longitude).toFixed(6)}`;
+  };
+
+  const appendHistoryPoint = useCallback((pt: Position, countAsNewDbInsert: boolean = false) => {
     if (!pt || !pt.device_id || (pt.latitude === 0 && pt.longitude === 0)) return;
+    const ptTime = pt.device_time || pt.recorded_at || pt.updated_at || '';
+    const coordKey = `${pt.device_id}_${ptTime}_${Number(pt.latitude).toFixed(6)}_${Number(pt.longitude).toFixed(6)}`;
+    const idKey = pt.id ? String(pt.id) : coordKey;
+    if (histKeySetRef.current.has(idKey) || histKeySetRef.current.has(coordKey)) return;
+
+    histKeySetRef.current.add(idKey);
+    histKeySetRef.current.add(coordKey);
+    if (histKeySetRef.current.size > MAX_IN_MEMORY_ROUTE_POINTS * 3) {
+      histKeySetRef.current.clear();
+    }
+
     setHistArr(prev => {
-      const ptTime = pt.device_time || pt.recorded_at || pt.updated_at || '';
-      const exists = prev.some(p =>
-        (pt.id && p.id === pt.id) ||
-        (p.device_id === pt.device_id &&
-          (p.device_time || p.recorded_at || p.updated_at || '') === ptTime &&
-          Math.abs(p.latitude - pt.latitude) < 1e-6 &&
-          Math.abs(p.longitude - pt.longitude) < 1e-6)
-      );
-      if (exists) return prev;
-      return [pt, ...prev];
+      const next = [pt, ...prev];
+      return next.length > MAX_IN_MEMORY_ROUTE_POINTS ? next.slice(0, MAX_IN_MEMORY_ROUTE_POINTS) : next;
     });
+
+    if (countAsNewDbInsert) {
+      setTotalHistoryCount(c => c + 1);
+      setHistoryPageRows(prev => [pt, ...prev].slice(0, HISTORY_PAGE_SIZE));
+    }
   }, [setHistArr]);
+
+  const loadHistoryPage = useCallback(async (
+    targetPage: number,
+    srcFilter: string,
+    devFilter: string,
+    clientOverride?: any
+  ) => {
+    const activeClient = clientOverride || supabase;
+    if (!activeClient) return;
+    const safePage = Math.max(1, targetPage);
+    setIsHistoryLoading(true);
+    try {
+      let query = activeClient
+        .from('gps_history')
+        .select('*', { count: 'exact' });
+      if (srcFilter !== 'all') query = query.eq('source', srcFilter);
+      if (devFilter !== 'all') query = query.eq('device_id', devFilter);
+      const from = (safePage - 1) * HISTORY_PAGE_SIZE;
+      const to = from + HISTORY_PAGE_SIZE - 1;
+      const { data, count, error } = await query
+        .order('server_time', { ascending: false, nullsFirst: false })
+        .range(from, to);
+
+      if (!error) {
+        if (typeof count === 'number') setTotalHistoryCount(count);
+        setHistoryPageRows(data || []);
+        setHistoryPage(safePage);
+      }
+    } finally {
+      setIsHistoryLoading(false);
+    }
+  }, [supabase]);
 
   useEffect(() => {
     if (gpsError && !gpsError.toLowerCase().includes('timeout')) {
@@ -160,43 +217,76 @@ export default function Dashboard() {
         .select('*')
         .order('updated_at', { ascending: false, nullsFirst: false });
 
-      // Fetch recent global history PLUS up to 1,000 rows per known device so high-frequency devices never crowd out other devices' routes
-      const perDeviceQueries = (liveData || []).map((dev: any) =>
-        client
-          .from('gps_history')
-          .select('*')
-          .eq('device_id', dev.device_id)
-          .order('server_time', { ascending: false, nullsFirst: false })
-          .limit(1000)
-      );
-
-      const [globalHistRes, ...perDeviceResList] = await Promise.all([
-        client
-          .from('gps_history')
-          .select('*')
-          .order('server_time', { ascending: false, nullsFirst: false })
-          .limit(1000),
-        ...perDeviceQueries
+      // Try server-side downsampling & centroid RPCs (scales to 1M+ rows), with graceful fallback if RPCs aren't deployed yet
+      const [decimatedRes, centroidRes] = await Promise.all([
+        client.rpc('get_route_decimated', { p_points_per_device: 600 }),
+        client.rpc('get_history_centroid'),
+        loadHistoryPage(1, 'all', 'all', client)
       ]);
 
-      const mergedMap = new Map<string, any>();
-      const ingestHistRows = (rows?: any[] | null) => {
-        if (!Array.isArray(rows)) return;
-        rows.forEach((row) => {
-          const key = row.id
-            ? String(row.id)
-            : `${row.device_id}_${row.device_time || row.server_time || ''}_${row.latitude}_${row.longitude}`;
-          if (!mergedMap.has(key)) mergedMap.set(key, row);
+      if (
+        !centroidRes?.error &&
+        Array.isArray(centroidRes?.data) &&
+        centroidRes.data[0] &&
+        Number(centroidRes.data[0].total_points) > 0
+      ) {
+        setServerCentroid({
+          total: Number(centroidRes.data[0].total_points),
+          lat: Number(centroidRes.data[0].avg_lat),
+          lng: Number(centroidRes.data[0].avg_lng)
         });
-      };
+      }
 
-      ingestHistRows(globalHistRes?.data);
-      perDeviceResList.forEach((res) => ingestHistRows(res?.data));
+      let historyData: any[] = [];
+      if (!decimatedRes?.error && Array.isArray(decimatedRes?.data) && decimatedRes.data.length > 0) {
+        historyData = decimatedRes.data;
+      } else {
+        // Fallback: fetch global recent + per-device latest 1,000 rows so all devices show route lines
+        const perDeviceQueries = (liveData || []).map((dev: any) =>
+          client
+            .from('gps_history')
+            .select('*')
+            .eq('device_id', dev.device_id)
+            .order('server_time', { ascending: false, nullsFirst: false })
+            .limit(1000)
+        );
 
-      const historyData = Array.from(mergedMap.values()).sort((a, b) => {
+        const [globalHistRes, ...perDeviceResList] = await Promise.all([
+          client
+            .from('gps_history')
+            .select('*')
+            .order('server_time', { ascending: false, nullsFirst: false })
+            .limit(1000),
+          ...perDeviceQueries
+        ]);
+
+        const mergedMap = new Map<string, any>();
+        const ingestHistRows = (rows?: any[] | null) => {
+          if (!Array.isArray(rows)) return;
+          rows.forEach((row) => {
+            const key = makeHistKey(row);
+            if (!mergedMap.has(key)) mergedMap.set(key, row);
+          });
+        };
+
+        ingestHistRows(globalHistRes?.data);
+        perDeviceResList.forEach((res) => ingestHistRows(res?.data));
+        historyData = Array.from(mergedMap.values());
+      }
+
+      historyData.sort((a, b) => {
         const ta = new Date(a.server_time || a.device_time || 0).getTime();
         const tb = new Date(b.server_time || b.device_time || 0).getTime();
         return tb - ta;
+      });
+
+      histKeySetRef.current.clear();
+      historyData.forEach((row) => {
+        histKeySetRef.current.add(makeHistKey(row));
+        const ptTime = row.device_time || row.recorded_at || row.updated_at || '';
+        histKeySetRef.current.add(
+          `${row.device_id}_${ptTime}_${Number(row.latitude).toFixed(6)}_${Number(row.longitude).toFixed(6)}`
+        );
       });
       
       const lastSeenSigByDev: Record<string, string> = {};
@@ -208,7 +298,7 @@ export default function Dashboard() {
         });
         setLivePos(liveMap);
       }
-      setHistArr(historyData);
+      setHistArr(historyData.slice(0, MAX_IN_MEMORY_ROUTE_POINTS));
 
       client.removeAllChannels();
 
@@ -242,7 +332,7 @@ export default function Dashboard() {
         
       client.channel('hist-log')
         .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'gps_history' }, (payload: any) => {
-          appendHistoryPoint(payload.new);
+          appendHistoryPoint(payload.new, true);
         }).subscribe();
 
       // Resilient polling fallback so Live Tracking Comparison stays real-time even if WebSocket stalls
@@ -497,8 +587,14 @@ export default function Dashboard() {
     lastHistoryRecordRef.current = null;
     lastTraccarRecordRef.current = {};
     lastIoTRecordRef.current = {};
+    histKeySetRef.current.clear();
     setLivePos({});
     setHistArr([]);
+    setHistoryPageRows([]);
+    setTotalHistoryCount(0);
+    setHistoryPage(1);
+    setServerCentroid(null);
+    setServerDeviceRows(null);
     setClearSignal(c => c + 1);
   };
 
@@ -520,8 +616,8 @@ export default function Dashboard() {
     ...histArr.map((p: any) => p.device_id)
   ])).filter(Boolean);
 
-  // Automatic real-time Accuracy Analysis
-  const autoAnalysis = useMemo(() => {
+  // Automatic real-time Accuracy Analysis (prefers full-DB Server SQL RPCs when installed)
+  const resolvedReference = useMemo(() => {
     void analysisTick;
     const validHist = histArr.filter(isValidCoord);
     const validLive = liveValues.filter(isValidCoord);
@@ -532,10 +628,14 @@ export default function Dashboard() {
     let statusMsg = 'กำลังคำนวณ...';
 
     if (refMode === 'centroid') {
-      if (allValid.length > 0) {
+      if (serverCentroid && serverCentroid.total > 0) {
+        resolvedLat = serverCentroid.lat;
+        resolvedLng = serverCentroid.lng;
+        statusMsg = `✓ Auto Centroid (จากฐานข้อมูลทั้งหมด ${serverCentroid.total.toLocaleString()} จุด)`;
+      } else if (allValid.length > 0) {
         resolvedLat = allValid.reduce((sum, p) => sum + p.latitude, 0) / allValid.length;
         resolvedLng = allValid.reduce((sum, p) => sum + p.longitude, 0) / allValid.length;
-        statusMsg = `✓ Auto Centroid (ค่าเฉลี่ยอัตโนมัติจาก ${allValid.length} จุด)`;
+        statusMsg = `✓ Auto Centroid (ค่าเฉลี่ยจาก ${allValid.length.toLocaleString()} จุดตัวอย่าง)`;
       } else {
         statusMsg = 'รอข้อมูลพิกัดเพื่อคำนวณอัตโนมัติ...';
       }
@@ -566,11 +666,59 @@ export default function Dashboard() {
       if (!isNaN(latNum) && !isNaN(lngNum)) {
         resolvedLat = latNum;
         resolvedLng = lngNum;
-        statusMsg = `✓ คำนวณอัตโนมัติจากพิกัดที่กำหนด (${allValid.length} จุด)`;
+        statusMsg = `✓ คำนวณอัตโนมัติจากพิกัดที่กำหนด (${(totalHistoryCount || allValid.length).toLocaleString()} จุด)`;
       } else {
         statusMsg = 'กรุณากรอก Latitude และ Longitude ให้ครบ';
       }
     }
+
+    return { resolvedLat, resolvedLng, statusMsg, validHist, validLive };
+  }, [analysisTick, refMode, refDeviceId, refLat, refLng, gpsPosition, histArr, liveValues, deviceOptions, serverCentroid, totalHistoryCount]);
+
+  // Query server-side million-row SQL analysis RPC whenever Analysis is open and reference changes
+  useEffect(() => {
+    if (!isAnalysisOpen || !supabase) return;
+    const { resolvedLat, resolvedLng } = resolvedReference;
+    if (resolvedLat === null || resolvedLng === null) {
+      setServerDeviceRows(null);
+      return;
+    }
+
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const { data, error } = await supabase.rpc('get_accuracy_analysis', {
+          p_ref_lat: resolvedLat,
+          p_ref_lng: resolvedLng
+        });
+        if (!cancelled && !error && Array.isArray(data) && data.length > 0) {
+          const mapped: DeviceAnalysisRow[] = data.map((r: any) => ({
+            deviceId: r.device_id,
+            source: r.source || 'unknown',
+            samples: Number(r.samples) || 0,
+            meanError: Number(r.mean_error) || 0,
+            stdDev: Number(r.std_dev) || 0,
+            min: Number(r.min_error) || 0,
+            max: Number(r.max_error) || 0,
+            avgAcc: r.avg_acc != null ? Number(r.avg_acc) : '-'
+          }));
+          setServerDeviceRows(mapped);
+        } else if (!cancelled && error) {
+          setServerDeviceRows(null);
+        }
+      } catch {
+        if (!cancelled) setServerDeviceRows(null);
+      }
+    }, 200);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [isAnalysisOpen, supabase, resolvedReference]);
+
+  const autoAnalysis = useMemo(() => {
+    const { resolvedLat, resolvedLng, statusMsg, validHist, validLive } = resolvedReference;
 
     if (resolvedLat === null || resolvedLng === null) {
       return {
@@ -586,15 +734,89 @@ export default function Dashboard() {
       };
     }
 
-    const getSourcePoints = (source: string) => {
-      const fromHist = validHist.filter(d => d.source === source);
-      return fromHist.length > 0 ? fromHist : validLive.filter(d => d.source === source);
-    };
+    let deviceRows: DeviceAnalysisRow[];
+    let bs: AnalysisStats;
+    let ts: AnalysisStats;
+    let is: AnalysisStats;
+    let ns: AnalysisStats;
+    let finalStatus = statusMsg;
 
-    const bs = computeStatsForPoints(getSourcePoints('browser'), resolvedLat, resolvedLng);
-    const ts = computeStatsForPoints(getSourcePoints('traccar'), resolvedLat, resolvedLng);
-    const is = computeStatsForPoints(getSourcePoints('iot'), resolvedLat, resolvedLng);
-    const ns = computeStatsForPoints(getSourcePoints('native'), resolvedLat, resolvedLng);
+    if (serverDeviceRows && serverDeviceRows.length > 0) {
+      deviceRows = serverDeviceRows;
+      const aggregateSource = (src: string): AnalysisStats => {
+        const rows = serverDeviceRows.filter(r => r.source === src && r.samples > 0);
+        if (rows.length === 0) return DEFAULT_ANALYSIS_STATS;
+        const totalN = rows.reduce((s, r) => s + r.samples, 0);
+        const weightedMean = rows.reduce((s, r) => s + r.meanError * r.samples, 0) / totalN;
+        const weightedStd = rows.reduce((s, r) => s + r.stdDev * r.samples, 0) / totalN;
+        const minErr = Math.min(...rows.map(r => r.min));
+        const maxErr = Math.max(...rows.map(r => r.max));
+        const accRows = rows.filter(r => typeof r.avgAcc === 'number');
+        const avgAcc =
+          accRows.length > 0
+            ? parseFloat(
+                (
+                  accRows.reduce((s, r) => s + Number(r.avgAcc) * r.samples, 0) /
+                  accRows.reduce((s, r) => s + r.samples, 0)
+                ).toFixed(2)
+              )
+            : '-';
+        return {
+          samples: totalN,
+          meanError: parseFloat(weightedMean.toFixed(2)),
+          stdDev: parseFloat(weightedStd.toFixed(2)),
+          min: parseFloat(minErr.toFixed(2)),
+          max: parseFloat(maxErr.toFixed(2)),
+          avgAcc,
+          barWidth: 0
+        };
+      };
+      bs = aggregateSource('browser');
+      ts = aggregateSource('traccar');
+      is = aggregateSource('iot');
+      ns = aggregateSource('native');
+      const totalAnalyzed = serverDeviceRows.reduce((s, r) => s + r.samples, 0);
+      finalStatus = `${statusMsg} • คำนวณ SQL เต็มฐานข้อมูล ${totalAnalyzed.toLocaleString()} แถว`;
+    } else {
+      const getSourcePoints = (source: string) => {
+        const fromHist = validHist.filter(d => d.source === source);
+        return fromHist.length > 0 ? fromHist : validLive.filter(d => d.source === source);
+      };
+
+      bs = computeStatsForPoints(getSourcePoints('browser'), resolvedLat, resolvedLng);
+      ts = computeStatsForPoints(getSourcePoints('traccar'), resolvedLat, resolvedLng);
+      is = computeStatsForPoints(getSourcePoints('iot'), resolvedLat, resolvedLng);
+      ns = computeStatsForPoints(getSourcePoints('native'), resolvedLat, resolvedLng);
+
+      const byDevice = new Map<string, Position[]>();
+      validHist.forEach(p => {
+        const list = byDevice.get(p.device_id) || [];
+        list.push(p);
+        byDevice.set(p.device_id, list);
+      });
+      validLive.forEach(p => {
+        if (!byDevice.has(p.device_id)) {
+          byDevice.set(p.device_id, [p]);
+        }
+      });
+
+      deviceRows = Array.from(byDevice.entries())
+        .map(([deviceId, pts]) => {
+          const st = computeStatsForPoints(pts, resolvedLat, resolvedLng);
+          return {
+            deviceId,
+            source: pts[0]?.source || 'unknown',
+            samples: Number(st.samples) || 0,
+            meanError: typeof st.meanError === 'number' ? st.meanError : 0,
+            stdDev: typeof st.stdDev === 'number' ? st.stdDev : 0,
+            min: typeof st.min === 'number' ? st.min : 0,
+            max: typeof st.max === 'number' ? st.max : 0,
+            avgAcc: st.avgAcc
+          };
+        })
+        .filter(r => r.samples > 0)
+        .sort((a, b) => a.meanError - b.meanError);
+    }
 
     const maxGlobalError = Math.max(
       typeof bs.meanError === 'number' ? bs.meanError : 0,
@@ -608,35 +830,6 @@ export default function Dashboard() {
       if (typeof is.meanError === 'number') is.barWidth = Math.min(100, (is.meanError / maxGlobalError) * 100);
       if (typeof ns.meanError === 'number') ns.barWidth = Math.min(100, (ns.meanError / maxGlobalError) * 100);
     }
-
-    const byDevice = new Map<string, Position[]>();
-    validHist.forEach(p => {
-      const list = byDevice.get(p.device_id) || [];
-      list.push(p);
-      byDevice.set(p.device_id, list);
-    });
-    validLive.forEach(p => {
-      if (!byDevice.has(p.device_id)) {
-        byDevice.set(p.device_id, [p]);
-      }
-    });
-
-    const deviceRows: DeviceAnalysisRow[] = Array.from(byDevice.entries())
-      .map(([deviceId, pts]) => {
-        const st = computeStatsForPoints(pts, resolvedLat!, resolvedLng!);
-        return {
-          deviceId,
-          source: pts[0]?.source || 'unknown',
-          samples: Number(st.samples) || 0,
-          meanError: typeof st.meanError === 'number' ? st.meanError : 0,
-          stdDev: typeof st.stdDev === 'number' ? st.stdDev : 0,
-          min: typeof st.min === 'number' ? st.min : 0,
-          max: typeof st.max === 'number' ? st.max : 0,
-          avgAcc: st.avgAcc
-        };
-      })
-      .filter(r => r.samples > 0)
-      .sort((a, b) => a.meanError - b.meanError);
 
     const sourceCandidates = [
       { label: 'Native (Android)', stats: ns },
@@ -661,7 +854,7 @@ export default function Dashboard() {
     return {
       displayLat: refMode === 'manual' ? refLat : resolvedLat.toFixed(6),
       displayLng: refMode === 'manual' ? refLng : resolvedLng.toFixed(6),
-      statusMsg,
+      statusMsg: finalStatus,
       browserStats: bs,
       traccarStats: ts,
       iotStats: is,
@@ -669,7 +862,7 @@ export default function Dashboard() {
       deviceRows,
       bestSummary
     };
-  }, [analysisTick, refMode, refDeviceId, refLat, refLng, gpsPosition, histArr, liveValues, deviceOptions]);
+  }, [resolvedReference, serverDeviceRows, refMode, refLat, refLng]);
 
   // Analysis Handlers
   const handleSetRefFromGPS = () => {
@@ -691,13 +884,30 @@ export default function Dashboard() {
     setRefLng('');
   };
 
-  const handleExportCSV = () => {
-    if (histArr.length === 0) {
+  const handleExportCSV = async () => {
+    let exportRows: any[] = [];
+    if (supabase) {
+      const chunkSize = 1000;
+      for (let offset = 0; offset < MAX_CSV_EXPORT_ROWS; offset += chunkSize) {
+        let query = supabase.from('gps_history').select('*');
+        if (filter.src !== 'all') query = query.eq('source', filter.src);
+        if (filter.dev !== 'all') query = query.eq('device_id', filter.dev);
+        const { data, error } = await query
+          .order('server_time', { ascending: false, nullsFirst: false })
+          .range(offset, offset + chunkSize - 1);
+        if (error || !Array.isArray(data) || data.length === 0) break;
+        exportRows.push(...data);
+        if (data.length < chunkSize) break;
+      }
+    }
+    if (exportRows.length === 0) exportRows = filteredHist;
+    if (exportRows.length === 0) {
       alert("ไม่มีข้อมูล History สำหรับ Export");
       return;
     }
+
     const headers = "id,device_id,source,latitude,longitude,speed,accuracy,recorded_date,recorded_time,device_time,server_time\n";
-    const csv = headers + histArr.map(d => {
+    const csv = headers + exportRows.map(d => {
       const rawTime = d.device_time || d.recorded_at || d.updated_at || '';
       let dateStr = '';
       let timeStr = '';
@@ -749,7 +959,10 @@ export default function Dashboard() {
         gpsOn={browserGpsActive}
         onToggleTracking={toggleTracking}
         onToggleBrowserGPS={toggleBrowserGPS}
-        onFilterChange={(src, dev) => setFilter({ src, dev })}
+        onFilterChange={(src, dev) => {
+          setFilter({ src, dev });
+          loadHistoryPage(1, src, dev);
+        }}
         currentSrc={filter.src}
         currentDev={filter.dev}
         deviceOptions={deviceOptions}
@@ -760,7 +973,15 @@ export default function Dashboard() {
 
       <MapArea stats={stats} theme={theme} liveData={filteredLive as any} historyData={filteredHist as any} clearSignal={clearSignal} />
       
-      <DataTables liveData={filteredLive as any} historyData={filteredHist as any} />
+      <DataTables
+        liveData={filteredLive as any}
+        historyData={(historyPageRows.length > 0 || totalHistoryCount > 0 ? historyPageRows : filteredHist) as any}
+        totalHistoryCount={totalHistoryCount || filteredHist.length}
+        historyPage={historyPage}
+        historyPageSize={HISTORY_PAGE_SIZE}
+        onHistoryPageChange={(nextPage) => loadHistoryPage(nextPage, filter.src, filter.dev)}
+        isHistoryLoading={isHistoryLoading}
+      />
 
       <AnalysisPanel 
         isVisible={isAnalysisOpen}

@@ -198,6 +198,14 @@ ALTER PUBLICATION supabase_realtime ADD TABLE public.gps_history;
 
 > **หมายเหตุสำหรับแอป Android (`MobileApp`):** ใน `SupabaseClient.kt` มีการส่งฟิลด์ `recorded_at` เข้า `gps_history` หากต้องการรองรับทั้ง `recorded_at` และ `device_time` สามารถเพิ่มคอลัมน์ `recorded_at TIMESTAMPTZ DEFAULT NOW()` ใน `gps_history` และใช้ `COALESCE(NEW.device_time, NEW.recorded_at, NOW())` ใน Trigger ได้
 
+### 🚀 การรองรับข้อมูลระดับ 1,000,000+ แถว (`supabase_scale_1m.sql`)
+
+เพื่อไม่ให้เกินเพดาน 1,000 แถวต่อคำขอของ PostgREST และไม่ให้เบราว์เซอร์ค้างเมื่อมีพิกัดสะสมหลายล้านจุด ให้รันไฟล์ [`supabase_scale_1m.sql`](./supabase_scale_1m.sql) ใน Supabase SQL Editor เพิ่มเติม ซึ่งประกอบด้วย:
+* **BRIN + Composite B-Tree Indexes:** ลดขนาด Index และเร่งความเร็ว Query Time-Series ระดับล้านแถว
+* **`get_route_decimated(p_points_per_device)`:** ลดรูปเส้นทางบน PostgreSQL Server ให้เหลือไม่เกิน `600` จุด/เครื่อง อย่างสม่ำเสมอ (เก็บจุดแรกและจุดสุดท้ายเสมอ)
+* **`get_accuracy_analysis(p_ref_lat, p_ref_lng)` & `get_history_centroid()`:** คำนวณ Haversine Error, Mean, Std Dev, Min/Max และ Centroid บน PostgreSQL ทั้งหมด 1,000,000+ แถวแล้วส่งเฉพาะผลสรุปรายเครื่องกลับมาที่หน้าเว็บ
+* **Frontend Optimization:** แผนที่เปิด `preferCanvas: true` + Decimation (`decimatePoints`), History Log แบ่งหน้าแบบ Server-Side (`50` แถว/หน้า ด้วย `.range()`), และ Export CSV ดึงแบบ Chunk ทีละ 1,000 แถว
+
 ---
 
 ## 🔌 วิธีการเชื่อมต่อแต่ละส่วน (Connection Guide)

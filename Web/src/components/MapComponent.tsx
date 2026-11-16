@@ -3,7 +3,7 @@
 import React, { useEffect, useRef } from 'react';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
-import { haversine, calculateBearing, formatDirectionTH } from '@/utils/calculations';
+import { haversine, calculateBearing, formatDirectionTH, decimatePoints } from '@/utils/calculations';
 
 interface MapComponentProps {
   theme: 'dark' | 'light';
@@ -118,6 +118,7 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
       zoom: 14,
       zoomControl: true,
       attributionControl: false,
+      preferCanvas: true,
     });
 
     tileLayerRef.current = L.tileLayer(
@@ -230,6 +231,13 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
 
       if (!ptMap.has(pointKey)) {
         ptMap.set(pointKey, { ...pos, _pointKey: pointKey });
+        // Compact in-memory store if a live session accumulates > 3000 points for one device
+        if (ptMap.size > 3000) {
+          const entries = Array.from(ptMap.entries());
+          const sampled = decimatePoints(entries, 2000);
+          ptMap.clear();
+          sampled.forEach(([k, v]) => ptMap.set(k, v));
+        }
       }
     };
 
@@ -288,7 +296,8 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
       }
 
       if (linePoints.length >= 2) {
-        const rawCoords = linePoints.map((p) => [p.latitude, p.longitude] as [number, number]);
+        const decimatedLinePts = decimatePoints(linePoints, 1000);
+        const rawCoords = decimatedLinePts.map((p) => [p.latitude, p.longitude] as [number, number]);
         const smoothCoords = smoothCoordinates(rawCoords);
 
         const firstPt = linePoints[0];
@@ -356,22 +365,29 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
         }
       }
 
-      // Draw or update every historical waypoint dot with its heading direction arrow
-      uniquePoints.forEach((pt, idx) => {
+      // Draw up to 80 sampled historical directional waypoints + newest 10 live points per device to keep 60fps at million-row scale
+      const renderWaypoints =
+        uniquePoints.length <= 90
+          ? uniquePoints
+          : [...decimatePoints(uniquePoints.slice(0, -10), 80), ...uniquePoints.slice(-10)];
+
+      const activeDotKeysForDevice = new Set<string>();
+      renderWaypoints.forEach((pt, idx) => {
         const ptTime = pt.device_time || pt.timestamp || pt.recorded_at || pt.updated_at || '';
-        const isStart = idx === 0 && uniquePoints.length > 1;
+        const isStart = idx === 0 && renderWaypoints.length > 1;
         const dotKey = `${deviceId}_${pt._pointKey || pt.id || `${pt.latitude.toFixed(6)}_${pt.longitude.toFixed(6)}_${idx}`}`;
+        activeDotKeysForDevice.add(dotKey);
 
         // Calculate the direction this point goes (to the next distinct coordinate, or from the previous distinct coordinate)
         let bearing: number | null = null;
         let nextTargetIdx: number | null = null;
 
-        for (let j = idx + 1; j < uniquePoints.length; j++) {
+        for (let j = idx + 1; j < renderWaypoints.length; j++) {
           if (
-            Math.abs(uniquePoints[j].latitude - pt.latitude) > 0.000002 ||
-            Math.abs(uniquePoints[j].longitude - pt.longitude) > 0.000002
+            Math.abs(renderWaypoints[j].latitude - pt.latitude) > 0.000002 ||
+            Math.abs(renderWaypoints[j].longitude - pt.longitude) > 0.000002
           ) {
-            bearing = calculateBearing(pt.latitude, pt.longitude, uniquePoints[j].latitude, uniquePoints[j].longitude);
+            bearing = calculateBearing(pt.latitude, pt.longitude, renderWaypoints[j].latitude, renderWaypoints[j].longitude);
             nextTargetIdx = j;
             break;
           }
@@ -380,23 +396,23 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
         if (bearing === null) {
           for (let j = idx - 1; j >= 0; j--) {
             if (
-              Math.abs(uniquePoints[j].latitude - pt.latitude) > 0.000002 ||
-              Math.abs(uniquePoints[j].longitude - pt.longitude) > 0.000002
+              Math.abs(renderWaypoints[j].latitude - pt.latitude) > 0.000002 ||
+              Math.abs(renderWaypoints[j].longitude - pt.longitude) > 0.000002
             ) {
-              bearing = calculateBearing(uniquePoints[j].latitude, uniquePoints[j].longitude, pt.latitude, pt.longitude);
+              bearing = calculateBearing(renderWaypoints[j].latitude, renderWaypoints[j].longitude, pt.latitude, pt.longitude);
               break;
             }
           }
         }
 
-        if (idx === uniquePoints.length - 1) {
+        if (idx === renderWaypoints.length - 1) {
           latestBearingByDevice[deviceId] = bearing;
         }
 
         const targetLabel =
           nextTargetIdx !== null
             ? `จุดที่ #${nextTargetIdx + 1}`
-            : idx < uniquePoints.length - 1
+            : idx < renderWaypoints.length - 1
             ? `จุดที่ #${idx + 2}`
             : 'จุดล่าสุด (ปัจจุบัน)';
 
@@ -447,6 +463,15 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
           wpMarker.bindPopup(dotPopup, { autoClose: false, closeOnClick: false });
           dotsGroupRef.current?.addLayer(wpMarker);
           dotMarkersRef.current[dotKey] = wpMarker;
+        }
+      });
+
+      // Prune decimated markers from previous pass for this device only (never deletes across devices)
+      Object.keys(dotMarkersRef.current).forEach((key) => {
+        if (key.startsWith(`${deviceId}_`) && !activeDotKeysForDevice.has(key)) {
+          const oldMarker = dotMarkersRef.current[key];
+          if (oldMarker) dotsGroupRef.current?.removeLayer(oldMarker);
+          delete dotMarkersRef.current[key];
         }
       });
     });
