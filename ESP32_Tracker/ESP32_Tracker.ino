@@ -33,9 +33,6 @@
 // ตั้งเป็น 0 = ปิด Firebase ส่งตรงเข้า Supabase + SD Card เท่านั้น (Compile & Upload เร็วขึ้นมาก)
 #define ENABLE_FIREBASE_SYNC 0
 
-// (ตัวเลือกเสริม) ใส่ Google Geolocation API Key หากต้องการระบุตำแหน่งกลางตึกทึบด้วย Wi-Fi Scan
-#define GOOGLE_GEOLOCATION_API_KEY ""
-
 #if ENABLE_FIREBASE_SYNC
   #include <Firebase_ESP_Client.h>
   #include "addons/TokenHelper.h"
@@ -93,8 +90,6 @@ bool hasCachedPos = false;
 unsigned long lastSendTime = 0;
 unsigned long lastQueueSyncTime = 0;
 unsigned long lastCacheSaveTime = 0;
-unsigned long lastIndoorFallbackTime = 0;
-unsigned long bootTimeMs = 0;
 
 const char* CSV_LOG_FILE   = "/gps_log.csv";
 const char* QUEUE_FILE     = "/offline_queue.jsonl";
@@ -151,29 +146,31 @@ static void writeLE32(uint8_t* buf, int32_t v) {
 }
 
 // ----------------------------------------------------------------------------
-// ปรับจูน u-blox NEO-M8N ให้จับสัญญาณอ่อนในอาคาร / ริมหน้าต่างไวขึ้น:
-// 1) CFG-RATE = 1 Hz (1000 ms) สะสมสัญญาณดาวเทียมได้นานขึ้น 5 เท่าและไม่ล้น 9600 baud
-// 2) CFG-NAV5 = Pedestrian + Auto 2D/3D + minElev=5° + cnoThresh=0
+// ปรับจูน u-blox NEO-M8N โหมดความแม่นยำสูงสุดด้วย Hardware อย่างเดียว:
+// 1) CFG-RATE = 1 Hz (1000 ms) สัญญาณนิ่งที่สุดและไม่ล้น 9600 baud
+// 2) CFG-NAV5 (mask=0x0117): 3D Only + MinElev 10° (กันสัญญาณสะท้อนกำแพง) + pDOP<=8.0 + C/N0>=18dBHz
 // ----------------------------------------------------------------------------
-void configureNeoM8nIndoor() {
+void configureNeoM8nHighAccuracy() {
   // 1. CFG-RATE (0x06, 0x08): measRate = 1000ms (0x03E8), navRate = 1, timeRef = GPS(1)
   uint8_t cfgRate[6] = { 0xE8, 0x03, 0x01, 0x00, 0x01, 0x00 };
   sendUBXPacket(0x06, 0x08, cfgRate, sizeof(cfgRate));
   delay(80);
 
-  // 2. CFG-NAV5 (0x06, 0x24): mask=0x0407 (dynModel + minEl + posFixMode + cnoThresh)
+  // 2. CFG-NAV5 (0x06, 0x24): mask = 0x0117 (dyn | minEl | posFixMode | posMask | cnoThreshold)
   uint8_t cfgNav5[36] = {0};
-  cfgNav5[0]  = 0x07; // mask LSB (dyn | minEl | posFixMode)
-  cfgNav5[1]  = 0x04; // mask MSB (cnoThresh)
-  cfgNav5[2]  = 3;    // dynModel: 3 = Pedestrian (นิ่งและไวในอาคาร)
-  cfgNav5[3]  = 3;    // fixMode:  3 = Auto 2D/3D (ล็อก 2D ได้ทันทีเมื่อเห็นแค่ 3 ดวง)
-  cfgNav5[12] = 5;    // minElev:  5° (รับดาวเทียมมุมต่ำที่ลอดผ่านหน้าต่าง)
-  cfgNav5[24] = 0;    // cnoThreshNumSVs = 0
-  cfgNav5[25] = 0;    // cnoThresh = 0 dBHz (ไม่ตัดสัญญาณอ่อนทิ้ง)
+  cfgNav5[0]  = 0x17; // mask LSB (0x0001 | 0x0002 | 0x0004 | 0x0010)
+  cfgNav5[1]  = 0x01; // mask MSB (0x0100 = cnoThreshold)
+  cfgNav5[2]  = 0;    // dynModel: 0 = Portable (สมดุลและแม่นยำทั้งเดินและเคลื่อนที่)
+  cfgNav5[3]  = 2;    // fixMode:  2 = 3D Only (ไม่เอาค่า 2D ที่เพี้ยนสูง)
+  cfgNav5[12] = 10;   // minElev:  10° (ตัดดาวเทียมมุมต่ำที่เกิดสัญญาณสะท้อน Multipath)
+  writeLE16(&cfgNav5[14], 80); // pDop: 8.0 (scale 0.1)
+  writeLE16(&cfgNav5[18], 40); // pAcc: 40 m
+  cfgNav5[24] = 4;    // cnoThreshNumSVs: อย่างน้อย 4 ดวง
+  cfgNav5[25] = 18;   // cnoThresh: 18 dBHz (คัดเฉพาะสัญญาณคุณภาพดี)
   sendUBXPacket(0x06, 0x24, cfgNav5, sizeof(cfgNav5));
   delay(80);
 
-  Serial.println("🛰️ [NEO-M8N] ตั้งค่าโหมดรับสัญญาณไวในอาคาร (1Hz + Auto 2D/3D + MinElev 5°) แล้ว");
+  Serial.println("🛰️ [NEO-M8N] ตั้งค่าโหมดความแม่นยำสูงสุด (1Hz + 3D Only + MinElev 10° + C/N0>=18dBHz) แล้ว");
 }
 
 // ----------------------------------------------------------------------------
@@ -507,101 +504,27 @@ void sendToFirebase(double lat, double lng, double speedKmh, double acc, const S
 }
 #endif
 
-// ส่งสถานะตำแหน่งเข้า gps_positions โดยตรง (ใช้ตอนรอ GPS ในอาคารจาก Wi-Fi / Cache)
-bool upsertLivePositionOnly(double lat, double lng, double acc, const String& statusLabel, const String& isoTime) {
-  if (WiFi.status() != WL_CONNECTED) return false;
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(3500);
-  String endpoint = String(SUPABASE_URL) + "/rest/v1/gps_positions?on_conflict=device_id";
-  if (!http.begin(client, endpoint)) return false;
-
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", SUPABASE_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-  http.addHeader("Prefer", "resolution=merge-duplicates,return=minimal");
-
-  String payload = "{";
-  payload += "\"device_id\":\"" + String(SUPABASE_DEVICE_ID) + "\",";
-  payload += "\"device_name\":\"" + String(SUPABASE_DEVICE_ID) + "\",";
-  payload += "\"latitude\":" + String(lat, 6) + ",";
-  payload += "\"longitude\":" + String(lng, 6) + ",";
-  payload += "\"speed\":0,";
-  payload += "\"accuracy\":" + String(acc, 1) + ",";
-  payload += "\"source\":\"iot\",";
-  payload += "\"app_status\":\"" + statusLabel + "\",";
-  payload += "\"is_online\":true";
-  if (isoTime.length() > 0) payload += ",\"device_time\":\"" + isoTime + "\"";
-  payload += "}";
-
-  int code = http.POST(payload);
-  http.end();
-  return code >= 200 && code < 300;
-}
-
-// ใช้ Google Geolocation API ผ่านการสแกน Wi-Fi BSSID รอบอาคาร (ถ้าใส่ API Key)
-bool fetchWifiGeolocation(double& outLat, double& outLng, double& outAcc) {
-  if (String(GOOGLE_GEOLOCATION_API_KEY).length() == 0 || WiFi.status() != WL_CONNECTED) return false;
-
-  int n = WiFi.scanNetworks(false, false, false, 200);
-  if (n <= 0) return false;
-
-  String body = "{\"wifiAccessPoints\":[";
-  int added = 0;
-  for (int i = 0; i < n && added < 8; i++) {
-    if (added > 0) body += ",";
-    body += "{\"macAddress\":\"" + WiFi.BSSIDstr(i) + "\",\"signalStrength\":" + String(WiFi.RSSI(i)) + "}";
-    added++;
-  }
-  body += "]}";
-  WiFi.scanDelete();
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient http;
-  http.setTimeout(4000);
-  String url = String("https://www.googleapis.com/geolocation/v1/geolocate?key=") + GOOGLE_GEOLOCATION_API_KEY;
-  if (!http.begin(client, url)) return false;
-  http.addHeader("Content-Type", "application/json");
-  int code = http.POST(body);
-  String resp = (code == 200) ? http.getString() : "";
-  http.end();
-  if (code != 200 || resp.length() == 0) return false;
-
-  int latIdx = resp.indexOf("\"lat\"");
-  int lngIdx = resp.indexOf("\"lng\"");
-  int accIdx = resp.indexOf("\"accuracy\"");
-  if (latIdx < 0 || lngIdx < 0) return false;
-
-  outLat = resp.substring(resp.indexOf(":", latIdx) + 1).toDouble();
-  outLng = resp.substring(resp.indexOf(":", lngIdx) + 1).toDouble();
-  outAcc = (accIdx >= 0) ? resp.substring(resp.indexOf(":", accIdx) + 1).toDouble() : 35.0;
-  return (outLat != 0.0 && outLng != 0.0);
-}
-
 // ==================== Setup ====================
 void setup() {
   Serial.begin(115200);
   delay(300);
-  bootTimeMs = millis();
 
-  // โหลดพิกัดล่าสุดที่เคยจำไว้ใน Flash NVS (สำหรับ Warm Start ของ NEO-M8N และ Indoor Fallback)
+  // โหลดพิกัดล่าสุดจาก Flash NVS เพื่อช่วย Warm Start ของชิป NEO-M8N เท่านั้น (ไม่ส่งค่า Cache ปลอมขึ้นเว็บ)
   prefs.begin("gps_cache", false);
   if (prefs.getBool("valid", false)) {
     cachedLat = prefs.getDouble("lat", 0.0);
     cachedLng = prefs.getDouble("lng", 0.0);
     hasCachedPos = (cachedLat != 0.0 && cachedLng != 0.0);
     if (hasCachedPos) {
-      Serial.printf("📌 [Flash Cache] พบพิกัดล่าสุดในเครื่อง: %.6f, %.6f\n", cachedLat, cachedLng);
+      Serial.printf("📌 [Warm Start] พบพิกัดช่วยเริ่มต้นใน Flash: %.6f, %.6f\n", cachedLat, cachedLng);
     }
   }
 
-  // GPS Setup (UART1: Pin 16=RX, 17=TX) + ปรับจูน NEO-M8N สำหรับสัญญาณอ่อนในอาคาร
+  // GPS Setup (UART1: Pin 16=RX, 17=TX) + ปรับจูน NEO-M8N โหมดความแม่นยำสูงสุด
   GPS.setRxBufferSize(1024);
   GPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   delay(800);
-  configureNeoM8nIndoor();
+  configureNeoM8nHighAccuracy();
 
   // เริ่มต้น SD Card (ใช้งานได้ทันทีแม้ไม่มี Wi-Fi)
   initSDCard();
@@ -619,7 +542,6 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\n✔ WiFi Connected! IP: " + WiFi.localIP().toString());
     configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
-    // รอ NTP สั้นๆ ไม่เกิน 2.5 วินาที เพื่อฉีดเวลาจริงเข้า NEO-M8N ช่วยให้จับดาวเทียมเร็วขึ้น
     struct tm tmCheck;
     getLocalTime(&tmCheck, 2500);
     injectM8nAssistance();
@@ -646,16 +568,18 @@ void loop() {
     injectM8nAssistance();
   }
 
-  // 2. เช็กเวลาทุกๆ 1 วินาที
+  // 2. เช็กเวลาทุกๆ 1 วินาที (รับเฉพาะค่า 3D Hardware Fix ที่ผ่านเกณฑ์ Sats >= 4 และ HDOP <= 3.5)
   if (millis() - lastSendTime >= LOG_INTERVAL_MS) {
     lastSendTime = millis();
 
-    if (gps.location.isValid() && gps.location.age() < 3000) {
+    int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+    double hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9;
+
+    if (gps.location.isValid() && gps.location.age() < 2500 && sats >= 4 && hdop <= 3.5) {
       double lat      = gps.location.lat();
       double lng      = gps.location.lng();
       double speedKmh = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
-      double acc      = gps.hdop.isValid() ? (gps.hdop.hdop() * 5.0) : 10.0;
-      int sats        = gps.satellites.isValid() ? gps.satellites.value() : 0;
+      double acc      = hdop * 2.5; // NEO-M8N ~2.5m CEP UERE x HDOP
       DeviceDateTime dt = getDeviceDateTime();
 
       // บันทึกพิกัดจริงลง Flash เพื่อช่วย Warm Start รอบหน้า (ครั้งแรกทันที หรือทุก 60 วิ)
@@ -664,8 +588,8 @@ void loop() {
         saveCachedPosition(lat, lng);
       }
 
-      Serial.printf("GPS Fix -> Lat: %.6f, Lng: %.6f, Speed: %.1f km/h, Sats: %d, Time: %s\n",
-                    lat, lng, speedKmh, sats, dt.timeTH.c_str());
+      Serial.printf("GPS Fix -> Lat: %.6f, Lng: %.6f, Speed: %.1f km/h, Sats: %d, HDOP: %.2f, Time: %s\n",
+                    lat, lng, speedKmh, sats, hdop, dt.timeTH.c_str());
 
       // ส่งเข้า Supabase (ต้องมี ISO Timestamp จริงจาก GPS หรือ NTP เพื่อกันชนคิว)
       bool synced = false;
@@ -693,28 +617,10 @@ void loop() {
       #if ENABLE_FIREBASE_SYNC
         sendToFirebase(lat, lng, speedKmh, acc, dt.timeTH);
       #endif
+    } else if (gps.location.isValid()) {
+      Serial.printf("⚠️ [Quality Gate] คัดกรองสัญญาณแกว่งออก (Sats: %d, HDOP: %.2f)\n", sats, hdop);
     } else {
-      int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
       Serial.printf("กำลังค้นหาสัญญาณดาวเทียม (NEO-M8N Sats: %d)...\n", sats);
-
-      // หากอยู่ในอาคารทึบเกิน 15 วินาทีแล้วยังไม่มีสัญญาณ GPS ให้ใช้ Wi-Fi Geo หรือ Flash Cache อัปเดตตำแหน่งบนเว็บชั่วคราวทุก 10 วิ
-      if (WiFi.status() == WL_CONNECTED &&
-          millis() - bootTimeMs > 15000 &&
-          millis() - lastIndoorFallbackTime >= 10000) {
-        lastIndoorFallbackTime = millis();
-        DeviceDateTime dt = getDeviceDateTime();
-        double wLat = 0, wLng = 0, wAcc = 40.0;
-        if (fetchWifiGeolocation(wLat, wLng, wAcc)) {
-          saveCachedPosition(wLat, wLng);
-          if (upsertLivePositionOnly(wLat, wLng, wAcc, "Indoor (Wi-Fi Positioning)", dt.isoTH)) {
-            Serial.printf("📶 [Indoor Wi-Fi] ระบุตำแหน่งในอาคาร: %.6f, %.6f (±%.0fm)\n", wLat, wLng, wAcc);
-          }
-        } else if (hasCachedPos) {
-          if (upsertLivePositionOnly(cachedLat, cachedLng, 50.0, "Indoor Cache (Waiting GPS)", dt.isoTH)) {
-            Serial.printf("🏠 [Indoor Cache] แสดงพิกัดล่าสุดระหว่างรอสัญญาณในอาคาร: %.6f, %.6f\n", cachedLat, cachedLng);
-          }
-        }
-      }
     }
   }
 
