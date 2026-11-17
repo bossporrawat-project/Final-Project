@@ -55,8 +55,18 @@
 #endif
 
 // ==================== 1. ตั้งค่า Wi-Fi และ Device ====================
-#define WIFI_SSID     "Boss"
-#define WIFI_PASSWORD "Boss2548"
+// ใส่ได้หลายเครือข่าย (ระบบจะสแกนเลือกสัญญาณ 2.4GHz ที่แรงที่สุดให้อัตโนมัติ)
+struct WifiCredential {
+  const char* ssid;
+  const char* pass;
+};
+
+const WifiCredential WIFI_LIST[] = {
+  { "AISFibre_C11_812_2.4G", "TU@C11812" }, // Wi-Fi บ้าน (คุยกับคอม/เว็บ /boss-sd ได้เร็วสุด)
+  { "Boss",                  "Boss2548"  }  // Hotspot มือถือ (ใช้ตอนออกนอกบ้าน / ในรถ EV)
+};
+const int WIFI_LIST_COUNT = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
+int activeWifiIdx = 0;
 
 const char* SUPABASE_DEVICE_ID = "IOT_ESP32_001"; // ชื่อใน Supabase / หน้าเว็บ Dashboard
 const char* FIREBASE_DEVICE_ID = "001";       // ชื่อ Node ใน Firebase (/gps_data/001)
@@ -131,6 +141,8 @@ struct DeviceDateTime {
   String isoTH;    // YYYY-MM-DDTHH:MM:SS+07:00
   bool hasRealDate;
 };
+
+void pumpSdWebClient();
 
 // ----------------------------------------------------------------------------
 // ส่งคำสั่ง UBX Binary พร้อมคำนวณ Fletcher-8 Checksum อัตโนมัติ (สำหรับ NEO-M8N)
@@ -553,8 +565,9 @@ void flushOfflineQueue() {
   int remainCount = 0;
 
   while (qFile.available()) {
-    // ยังคงรับข้อมูล GPS ต่อเนื่องระหว่างทยอยส่งคิว
+    // ยังคงรับข้อมูล GPS และคำขอเว็บลับต่อเนื่องระหว่างทยอยส่งคิว
     while (GPS.available() > 0) gps.encode(GPS.read());
+    pumpSdWebClient();
 
     String line = qFile.readStringUntil('\n');
     line.trim();
@@ -1166,6 +1179,13 @@ void initSdWebServerIfReady() {
     Serial.printf("🔐 [SD Web - WiFi STA]  http://%s%s\n", WiFi.localIP().toString().c_str(), SD_WEB_SECRET_PATH);
   }
 }
+void pumpSdWebClient() {
+  if (sdWebStarted) {
+    sdWebServer.handleClient();
+  }
+}
+#else
+void pumpSdWebClient() {}
 #endif
 
 bool scanAndReportWifiTarget() {
@@ -1176,6 +1196,7 @@ bool scanAndReportWifiTarget() {
   Serial.println("🔍 [WiFi Scan] กำลังสแกนหาสัญญาณ Wi-Fi 2.4GHz รอบตัว...");
   int found = WiFi.scanNetworks(false, false, false, 120);
   bool targetFound = false;
+  int32_t bestRssi = -999;
 
   if (found <= 0) {
     Serial.println("⚠️ [WiFi Scan] ไม่พบคลื่น Wi-Fi 2.4GHz รอบข้างเลย");
@@ -1186,15 +1207,31 @@ bool scanAndReportWifiTarget() {
       String ssid = WiFi.SSID(i);
       int32_t rssi = WiFi.RSSI(i);
       int32_t ch = WiFi.channel(i);
-      if (ssid == String(WIFI_SSID)) {
+
+      int matchedIdx = -1;
+      for (int w = 0; w < WIFI_LIST_COUNT; w++) {
+        if (ssid == String(WIFI_LIST[w].ssid)) {
+          matchedIdx = w;
+          break;
+        }
+      }
+
+      if (matchedIdx >= 0) {
         targetFound = true;
         Serial.printf("   ✅ เจอเป้าหมาย \"%s\" (RSSI: %d dBm, Ch: %d)\n", ssid.c_str(), (int)rssi, (int)ch);
+        if (rssi > bestRssi) {
+          bestRssi = rssi;
+          activeWifiIdx = matchedIdx;
+        }
       } else if (i < showCount) {
         Serial.printf("   - %s (%d dBm, Ch: %d)\n", ssid.c_str(), (int)rssi, (int)ch);
       }
     }
     if (!targetFound) {
-      Serial.printf("❌ [WiFi Scan] ไม่พบชื่อ \"%s\" บนคลื่น 2.4GHz (อาจปิด Hotspot อยู่ หรือเปิดเฉพาะ 5GHz)\n", WIFI_SSID);
+      Serial.println("❌ [WiFi Scan] ไม่พบ Wi-Fi เป้าหมายในรายการเลย (อาจปิด Hotspot/Router อยู่ หรือเปิดเฉพาะ 5GHz)");
+    } else {
+      Serial.printf("🎯 [WiFi] เลือกเชื่อมต่อ \"%s\" (สัญญาณแรงสุด: %d dBm)\n",
+                    WIFI_LIST[activeWifiIdx].ssid, (int)bestRssi);
     }
   }
 
@@ -1227,24 +1264,14 @@ void setup() {
   // เริ่มต้น SD Card (ใช้งานได้ทันทีแม้ไม่มี Wi-Fi)
   initSDCard();
 
-  // สแกนเช็กก่อนว่าเจอ Wi-Fi เป้าหมาย ("Boss") ในระยะ 2.4GHz หรือไม่ แล้วเปิด Hotspot ส่วนตัว + STA
+  // 1) สแกนเลือก Wi-Fi ที่แรงที่สุดในรายการ แล้วต่อ STA ก่อนเพื่อล็อก Channel ให้ตรงกัน
   bool wifiTargetFound = scanAndReportWifiTarget();
 
-  #if SD_WEB_ENABLE && SD_AP_ENABLE
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(SD_AP_SSID, SD_AP_PASSWORD, 1, SD_AP_HIDDEN, 4);
-    Serial.printf("📶 [SD AP] เปิด Hotspot ส่วนตัว \"%s\" (Pass: %s) IP: %s\n",
-                  SD_AP_SSID, SD_AP_PASSWORD, WiFi.softAPIP().toString().c_str());
-    initSdWebServerIfReady();
-  #else
-    WiFi.mode(WIFI_STA);
-  #endif
-
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(WIFI_LIST[activeWifiIdx].ssid, WIFI_LIST[activeWifiIdx].pass);
   lastWifiRetryTime = millis();
   if (wifiTargetFound) {
-    Serial.print("Connecting to WiFi");
+    Serial.printf("Connecting to WiFi (%s)", WIFI_LIST[activeWifiIdx].ssid);
     unsigned long wifiStart = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 8000) {
       delay(400);
@@ -1254,8 +1281,19 @@ void setup() {
     delay(300);
   }
 
+  // 2) เปิด Hotspot ส่วนตัวบน Channel เดียวกับ STA (ป้องกันปัญหา DHCP/AP หลุดตอนสลับช่อง)
+  #if SD_WEB_ENABLE && SD_AP_ENABLE
+    int apChannel = (WiFi.status() == WL_CONNECTED && WiFi.channel() > 0) ? WiFi.channel() : 1;
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+    WiFi.softAP(SD_AP_SSID, SD_AP_PASSWORD, apChannel, SD_AP_HIDDEN, 4);
+    Serial.printf("📶 [SD AP] เปิด Hotspot ส่วนตัว \"%s\" (Pass: %s, Ch: %d) IP: %s\n",
+                  SD_AP_SSID, SD_AP_PASSWORD, apChannel, WiFi.softAPIP().toString().c_str());
+    initSdWebServerIfReady();
+  #endif
+
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\n✔ WiFi Connected! IP: " + WiFi.localIP().toString());
+    Serial.println("\n✔ WiFi Connected (" + String(WIFI_LIST[activeWifiIdx].ssid) + ")! IP: " + WiFi.localIP().toString());
     configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
     ntpConfigured = true;
     struct tm tmCheck;
@@ -1268,7 +1306,7 @@ void setup() {
       initFirebaseIfReady();
     #endif
   } else {
-    Serial.println("\n⚠️ ยังไม่พบ Wi-Fi \"Boss\" — บันทึกลง SD Card และเข้าอ่านผ่าน Hotspot \"" SD_AP_SSID "\" ได้ทันที");
+    Serial.println("\n⚠️ ยังไม่พบ Wi-Fi ในรายการ — บันทึกลง SD Card และเข้าอ่านผ่าน Hotspot \"" SD_AP_SSID "\" ได้ทันที");
   }
 }
 
@@ -1308,21 +1346,22 @@ void loop() {
     } else if (apClients == 0 && staPausedForAp) {
       staPausedForAp = false;
       WiFi.setAutoReconnect(true);
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-      Serial.println("📡 [WiFi] ผู้ใช้หลุดจาก SD AP แล้ว -> กลับมารอเชื่อม \"Boss\" ต่อ");
+      WiFi.begin(WIFI_LIST[activeWifiIdx].ssid, WIFI_LIST[activeWifiIdx].pass);
+      Serial.printf("📡 [WiFi] ผู้ใช้หลุดจาก SD AP แล้ว -> กลับมารอเชื่อม \"%s\" ต่อ\n", WIFI_LIST[activeWifiIdx].ssid);
     }
   #endif
 
-  // ปล่อยให้ AutoReconnect ของ ESP32 ทำงานเบื้องหลัง ไม่เรียก WiFi.begin() ชนตอนกำลังเชื่อม
+  // ปล่อยให้ AutoReconnect ของ ESP32 ทำงานเบื้องหลัง และสลับ Wi-Fi ในรายการเมื่อล้มเหลว
   if (WiFi.status() != WL_CONNECTED) {
-    if (!staPausedForAp && millis() - lastWifiRetryTime >= 30000) {
+    if (!staPausedForAp && millis() - lastWifiRetryTime >= 20000) {
       lastWifiRetryTime = millis();
       wl_status_t st = WiFi.status();
-      if (st == WL_CONNECT_FAILED || st == WL_STOPPED) {
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      if (st == WL_CONNECT_FAILED || st == WL_STOPPED || st == WL_NO_SSID_AVAIL) {
+        activeWifiIdx = (activeWifiIdx + 1) % WIFI_LIST_COUNT;
+        WiFi.begin(WIFI_LIST[activeWifiIdx].ssid, WIFI_LIST[activeWifiIdx].pass);
       }
       Serial.printf("📡 [WiFi] รอเชื่อม \"%s\" (2.4GHz, status=%d) — บันทึกลง SD Card ต่อเนื่อง\n",
-                    WIFI_SSID, (int)st);
+                    WIFI_LIST[activeWifiIdx].ssid, (int)st);
     }
   } else {
     if (!ntpConfigured) {
@@ -1337,11 +1376,7 @@ void loop() {
     #endif
   }
 
-  #if SD_WEB_ENABLE
-    if (sdWebStarted) {
-      sdWebServer.handleClient();
-    }
-  #endif
+  pumpSdWebClient();
 
   // 2. เก็บข้อมูลทันทีที่ NEO-M8N ส่งพิกัดใหม่รอบ 5 Hz (ทุก ~200 ms)
   if (gps.location.isUpdated() && millis() - lastSendTime >= 150) {
