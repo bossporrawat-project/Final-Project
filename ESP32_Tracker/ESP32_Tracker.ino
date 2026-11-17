@@ -33,6 +33,15 @@
 // ตั้งเป็น 0 = ปิด Firebase ส่งตรงเข้า Supabase + SD Card เท่านั้น (Compile & Upload เร็วขึ้นมาก)
 #define ENABLE_FIREBASE_SYNC 0
 
+// เว็บลับในตัว ESP32 สำหรับอ่าน/ดาวน์โหลดไฟล์ทั้งหมดใน SD Card (แยกจากเว็บหลัก Next.js โดยสิ้นเชิง)
+#define SD_WEB_ENABLE      1
+#define SD_WEB_PORT        80
+#define SD_WEB_SECRET_PATH "/boss-sd"
+
+#if SD_WEB_ENABLE
+  #include <WebServer.h>
+#endif
+
 #if ENABLE_FIREBASE_SYNC
   #include <Firebase_ESP_Client.h>
   #include "addons/TokenHelper.h"
@@ -576,6 +585,513 @@ void sendToFirebase(double lat, double lng, double speedKmh, double acc, const S
 }
 #endif
 
+#if SD_WEB_ENABLE
+// ============================================================================
+// 🔐 Hidden SD Card Web Reader (ฝังในตัว ESP32 แยกจากเว็บหลัก Next.js โดยสิ้นเชิง)
+// เข้าถึงเฉพาะพาธลับ SD_WEB_SECRET_PATH เท่านั้น (หน้า "/" ปกติจะคืนค่า 404 Not Found)
+// ============================================================================
+WebServer sdWebServer(SD_WEB_PORT);
+bool sdWebStarted = false;
+
+static const char SD_WEB_HTML[] PROGMEM = R"BOSS_SD_HTML(<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SD Card Vault</title>
+<style>
+  :root{--bg:#0b1020;--card:#131b30;--card2:#0f1628;--bd:#24314f;--tx:#e6edf7;--mu:#8ea0bf;--ac:#38bdf8;--ok:#22c55e;--wa:#f59e0b;--er:#ef4444}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  header{padding:14px 18px;border-bottom:1px solid var(--bd);background:var(--card2);display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between}
+  .brand{font-weight:700;font-size:16px;display:flex;align-items:center;gap:8px}
+  .pills{display:flex;flex-wrap:wrap;gap:8px}
+  .pill{padding:4px 10px;border-radius:999px;background:var(--card);border:1px solid var(--bd);font-size:12px;color:var(--mu)}
+  .pill b{color:var(--tx)}
+  main{display:grid;grid-template-columns:320px 1fr;gap:14px;padding:14px;min-height:calc(100vh - 60px)}
+  @media(max-width:860px){main{grid-template-columns:1fr}}
+  .panel{background:var(--card);border:1px solid var(--bd);border-radius:12px;display:flex;flex-direction:column;overflow:hidden}
+  .ph{padding:11px 14px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between;gap:8px;background:var(--card2)}
+  .ph h2{margin:0;font-size:14px}
+  .toolbar{padding:10px 12px;border-bottom:1px solid var(--bd);display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+  input[type=text]{background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:8px;padding:6px 10px;font-size:13px;outline:none}
+  input[type=text]:focus{border-color:var(--ac)}
+  button,.btn{background:#1c2844;color:var(--tx);border:1px solid var(--bd);border-radius:8px;padding:6px 10px;font-size:12px;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:5px}
+  button:hover,.btn:hover{border-color:var(--ac)}
+  button.primary{background:#0ea5e9;border-color:#0ea5e9;color:#061224;font-weight:600}
+  button.danger{border-color:#7f1d1d;color:#fca5a5}
+  button.danger:hover{background:#7f1d1d;color:#fff}
+  button.active{background:var(--ac);color:#061224;border-color:var(--ac);font-weight:600}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  #fileList{overflow:auto;max-height:72vh;padding:6px}
+  .fitem{padding:8px 10px;border-radius:8px;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:8px;border:1px solid transparent}
+  .fitem:hover{background:rgba(56,189,248,.08)}
+  .fitem.sel{background:rgba(56,189,248,.16);border-color:rgba(56,189,248,.4)}
+  .fpath{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;word-break:break-all}
+  .fsize{font-size:11px;color:var(--mu);white-space:nowrap}
+  .viewer{flex:1;overflow:auto;max-height:72vh;background:var(--bg)}
+  pre{margin:0;padding:12px;font:12.5px/1.55 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:#cfe2ff}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{padding:6px 9px;border-bottom:1px solid #1b2540;text-align:left;white-space:nowrap}
+  th{position:sticky;top:0;background:var(--card2);color:var(--ac);z-index:1}
+  tr:hover td{background:rgba(255,255,255,.03)}
+  a.map{color:var(--ac);text-decoration:none}
+  a.map:hover{text-decoration:underline}
+  .empty{padding:28px;text-align:center;color:var(--mu)}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">🔒 SD Card Vault <span style="font-size:12px;color:var(--mu);font-weight:400">(ESP32 Local Storage)</span></div>
+  <div class="pills" id="stats">
+    <span class="pill">SD: <b id="stSd">...</b></span>
+    <span class="pill">GPS: <b id="stGps">...</b></span>
+    <span class="pill">Wi-Fi: <b id="stWifi">...</b></span>
+  </div>
+</header>
+<main>
+  <section class="panel">
+    <div class="ph">
+      <h2>📁 ไฟล์ทั้งหมด (<span id="fileCount">0</span>)</h2>
+      <button onclick="loadAll()">🔄 รีเฟรช</button>
+    </div>
+    <div class="toolbar">
+      <input type="text" id="fileFilter" placeholder="ค้นหาชื่อไฟล์..." style="width:100%" oninput="renderFiles()">
+    </div>
+    <div id="fileList"><div class="empty">กำลังโหลดรายการไฟล์...</div></div>
+  </section>
+
+  <section class="panel">
+    <div class="ph">
+      <h2 id="curTitle">เลือกไฟล์จากด้านซ้ายเพื่ออ่านข้อมูล</h2>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <a class="btn" id="btnDl" href="#" style="display:none" download>⬇ ดาวน์โหลด</a>
+        <button class="danger" id="btnDel" style="display:none" onclick="deleteCurrent()">🗑 ลบไฟล์</button>
+      </div>
+    </div>
+    <div class="toolbar">
+      <button id="mTable" class="active" onclick="setMode('table')">ตารางข้อมูล</button>
+      <button id="mRaw" onclick="setMode('raw')">ข้อความดิบ</button>
+      <button onclick="loadChunk(0,false)">⏮ เริ่มไฟล์</button>
+      <button onclick="stepChunk(-1)">◀ ก่อนหน้า</button>
+      <button onclick="stepChunk(1)">ถัดไป ▶</button>
+      <button class="primary" onclick="loadChunk(0,true)">⏭ ท้ายไฟล์ล่าสุด</button>
+      <input type="text" id="rowFilter" placeholder="กรองข้อความ/วันที่..." style="flex:1;min-width:150px" oninput="renderContent()">
+      <span id="chunkInfo" style="font-size:12px;color:var(--mu)"></span>
+    </div>
+    <div class="viewer" id="viewer"><div class="empty">ยังไม่ได้เลือกไฟล์</div></div>
+  </section>
+</main>
+<script>
+const BASE = location.pathname.replace(/\/+$/, '');
+const CHUNK = 16384;
+const GPS_COLS = ['device_id','date','time','iso','lat','lng','speed','acc_m','sats','synced'];
+let files = [];
+let curFile = '';
+let curSize = 0;
+let curOffset = 0;
+let curText = '';
+let viewMode = 'table';
+
+function fmtBytes(b){
+  if(b < 1024) return b + ' B';
+  if(b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  return (b/1048576).toFixed(2) + ' MB';
+}
+function esc(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+async function loadInfo(){
+  try{
+    const r = await fetch(BASE + '/api/info');
+    const d = await r.json();
+    document.getElementById('stSd').textContent = d.sdReady
+      ? `${fmtBytes(d.usedBytes)} / ${fmtBytes(d.totalBytes)} (${d.cardType})`
+      : 'ไม่พบการ์ด';
+    document.getElementById('stGps').textContent = d.gpsValid
+      ? `${d.lat.toFixed(5)}, ${d.lng.toFixed(5)} | Sats:${d.sats} | ${d.ev5Hz ? '5Hz' : '1Hz'}`
+      : `Searching (Sats:${d.sats})`;
+    document.getElementById('stWifi').textContent = `${d.ip} (${d.rssi} dBm)`;
+  }catch(e){}
+}
+
+async function loadFiles(){
+  const el = document.getElementById('fileList');
+  try{
+    const r = await fetch(BASE + '/api/list');
+    const d = await r.json();
+    files = d.files || [];
+    renderFiles();
+    if(!curFile){
+      const pref = files.find(f => !f.isDir && f.path === '/gps_log.csv') || files.find(f => !f.isDir);
+      if(pref) selectFile(pref.path, true);
+    }
+  }catch(e){
+    el.innerHTML = '<div class="empty">โหลดรายการไฟล์ไม่สำเร็จ</div>';
+  }
+}
+
+function renderFiles(){
+  const q = document.getElementById('fileFilter').value.trim().toLowerCase();
+  const list = files.filter(f => !q || f.path.toLowerCase().includes(q));
+  document.getElementById('fileCount').textContent = list.length;
+  const el = document.getElementById('fileList');
+  if(!list.length){ el.innerHTML = '<div class="empty">ไม่พบไฟล์ใน SD Card</div>'; return; }
+  el.innerHTML = list.map(f => {
+    const active = f.path === curFile ? ' sel' : '';
+    const icon = f.isDir ? '📂' : (f.path.endsWith('.csv') ? '📊' : (f.path.endsWith('.jsonl') ? '📦' : '📄'));
+    const click = f.isDir ? '' : `data-path="${esc(f.path)}" onclick="selectFile(this.dataset.path,true)"`;
+    return `<div class="fitem${active}" ${click}>
+      <div class="fpath">${icon} ${esc(f.path)}</div>
+      <div class="fsize">${f.isDir ? 'DIR' : fmtBytes(f.size)}</div>
+    </div>`;
+  }).join('');
+}
+
+function selectFile(path, tail){
+  curFile = path;
+  renderFiles();
+  document.getElementById('curTitle').textContent = path;
+  const dl = document.getElementById('btnDl');
+  dl.href = BASE + '/api/download?path=' + encodeURIComponent(path);
+  dl.style.display = 'inline-flex';
+  document.getElementById('btnDel').style.display = 'inline-flex';
+  loadChunk(0, tail);
+}
+
+async function loadChunk(offset, tail){
+  if(!curFile) return;
+  const viewer = document.getElementById('viewer');
+  viewer.innerHTML = '<div class="empty">กำลังอ่านไฟล์จาก SD Card...</div>';
+  const url = `${BASE}/api/view?path=${encodeURIComponent(curFile)}&offset=${Math.max(0,offset)}&limit=${CHUNK}&tail=${tail?1:0}`;
+  try{
+    const r = await fetch(url);
+    if(!r.ok){ viewer.innerHTML = `<div class="empty">อ่านไฟล์ไม่สำเร็จ (${r.status})</div>`; return; }
+    curSize = parseInt(r.headers.get('X-File-Size') || '0', 10);
+    curOffset = parseInt(r.headers.get('X-Offset') || '0', 10);
+    curText = await r.text();
+    document.getElementById('chunkInfo').textContent =
+      `ไบต์ ${curOffset.toLocaleString()} - ${(curOffset + curText.length).toLocaleString()} / ${curSize.toLocaleString()} B`;
+    renderContent();
+  }catch(e){
+    viewer.innerHTML = '<div class="empty">เกิดข้อผิดพลาดในการเชื่อมต่อ ESP32</div>';
+  }
+}
+
+function stepChunk(dir){
+  if(!curFile) return;
+  const next = dir < 0 ? Math.max(0, curOffset - CHUNK) : Math.min(Math.max(0, curSize - CHUNK), curOffset + CHUNK);
+  loadChunk(next, false);
+}
+
+function setMode(m){
+  viewMode = m;
+  document.getElementById('mTable').classList.toggle('active', m === 'table');
+  document.getElementById('mRaw').classList.toggle('active', m === 'raw');
+  renderContent();
+}
+
+function renderContent(){
+  const viewer = document.getElementById('viewer');
+  if(!curFile){ viewer.innerHTML = '<div class="empty">ยังไม่ได้เลือกไฟล์</div>'; return; }
+  const q = document.getElementById('rowFilter').value.trim().toLowerCase();
+  const isCsv = curFile.toLowerCase().endsWith('.csv');
+  const isJsonl = curFile.toLowerCase().endsWith('.jsonl');
+
+  if(viewMode === 'raw' || (!isCsv && !isJsonl)){
+    const text = q ? curText.split(/\r?\n/).filter(l => l.toLowerCase().includes(q)).join('\n') : curText;
+    viewer.innerHTML = `<pre>${esc(text || '(ไฟล์ว่าง)')}</pre>`;
+    return;
+  }
+
+  const lines = curText.split(/\r?\n/).filter(Boolean);
+  if(!lines.length){ viewer.innerHTML = '<div class="empty">ไม่มีข้อมูลในช่วงนี้</div>'; return; }
+
+  if(isJsonl){
+    const filtered = q ? lines.filter(l => l.toLowerCase().includes(q)) : lines;
+    const rows = [];
+    for(const line of filtered){
+      try{
+        const parsed = JSON.parse(line);
+        if(Array.isArray(parsed)) rows.push(...parsed);
+        else rows.push(parsed);
+      }catch(_){}
+    }
+    if(!rows.length){ viewer.innerHTML = `<pre>${esc(filtered.join('\n'))}</pre>`; return; }
+    const cols = Object.keys(rows[0]);
+    const head = cols.map(c => `<th>${esc(c)}</th>`).join('') + '<th>Map</th>';
+    const body = rows.slice(-300).reverse().map(row => {
+      const mapLink = (row.latitude && row.longitude)
+        ? `<td><a class="map" target="_blank" href="https://maps.google.com/?q=${row.latitude},${row.longitude}">📍 ดูแผนที่</a></td>`
+        : '<td>-</td>';
+      return '<tr>' + cols.map(c => `<td>${esc(row[c] ?? '')}</td>`).join('') + mapLink + '</tr>';
+    }).join('');
+    viewer.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    return;
+  }
+
+  let headers = null;
+  let dataLines = lines;
+  if(curOffset === 0){
+    headers = lines[0].split(',');
+    dataLines = lines.slice(1);
+  } else {
+    if(lines.length > 1) dataLines = lines.slice(1);
+    const sample = (dataLines[0] || '').split(',');
+    headers = sample.length === GPS_COLS.length ? GPS_COLS : sample.map((_,i)=>'col_'+(i+1));
+  }
+  const filtered = q ? dataLines.filter(l => l.toLowerCase().includes(q)) : dataLines;
+  const latIdx = headers.findIndex(h => h.toLowerCase().includes('lat'));
+  const lngIdx = headers.findIndex(h => h.toLowerCase().includes('lon') || h.toLowerCase().includes('lng'));
+  const head = headers.map(h => `<th>${esc(h)}</th>`).join('') + (latIdx>=0 && lngIdx>=0 ? '<th>Map</th>' : '');
+  const body = filtered.slice(-400).reverse().map(l => {
+    const cells = l.split(',');
+    let mapTd = '';
+    if(latIdx>=0 && lngIdx>=0){
+      const la = parseFloat(cells[latIdx]), ln = parseFloat(cells[lngIdx]);
+      mapTd = (!isNaN(la) && !isNaN(ln))
+        ? `<td><a class="map" target="_blank" href="https://maps.google.com/?q=${la},${ln}">📍 ดูแผนที่</a></td>`
+        : '<td>-</td>';
+    }
+    return '<tr>' + headers.map((_,i)=>`<td>${esc(cells[i] ?? '')}</td>`).join('') + mapTd + '</tr>';
+  }).join('');
+  viewer.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+async function deleteCurrent(){
+  if(!curFile) return;
+  if(!confirm('ยืนยันลบไฟล์ ' + curFile + ' ออกจาก SD Card?\n(กู้คืนไม่ได้)')) return;
+  const r = await fetch(BASE + '/api/delete?path=' + encodeURIComponent(curFile), { method: 'POST' });
+  if(r.ok){
+    curFile = '';
+    curText = '';
+    document.getElementById('btnDl').style.display = 'none';
+    document.getElementById('btnDel').style.display = 'none';
+    document.getElementById('curTitle').textContent = 'ลบไฟล์เรียบร้อย';
+    document.getElementById('viewer').innerHTML = '<div class="empty">ลบไฟล์แล้ว</div>';
+    loadAll();
+  }else{
+    alert('ลบไฟล์ไม่สำเร็จ (' + r.status + ')');
+  }
+}
+
+function loadAll(){ loadInfo(); loadFiles(); }
+loadAll();
+setInterval(loadInfo, 5000);
+</script>
+</body>
+</html>)BOSS_SD_HTML";
+
+static String sanitizeSdPath(String rawPath) {
+  rawPath.trim();
+  if (rawPath.length() == 0) return "/";
+  if (!rawPath.startsWith("/")) rawPath = "/" + rawPath;
+  if (rawPath.indexOf("..") >= 0) return "";
+  return rawPath;
+}
+
+static void appendJsonEscaped(String& out, const String& s) {
+  out.reserve(out.length() + s.length() + 4);
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (c == '\\' || c == '"') {
+      out += '\\';
+      out += c;
+    } else if (c == '\n') {
+      out += "\\n";
+    } else if (c == '\r') {
+      out += "\\r";
+    } else if ((uint8_t)c >= 0x20) {
+      out += c;
+    }
+  }
+}
+
+static void appendSdTreeJson(const String& dirPath, String& out, bool& firstItem, int depth, int& count) {
+  if (depth > 4 || count >= 250) return;
+  File dir = SD.open(dirPath);
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    return;
+  }
+
+  File entry = dir.openNextFile();
+  while (entry && count < 250) {
+    while (GPS.available() > 0) gps.encode(GPS.read());
+
+    bool isDir = entry.isDirectory();
+    size_t sz = isDir ? 0 : entry.size();
+    String entryPath = String(entry.path());
+    if (entryPath.length() == 0) {
+      entryPath = (dirPath == "/" ? "/" : dirPath + "/") + String(entry.name());
+    }
+    if (!entryPath.startsWith("/")) entryPath = "/" + entryPath;
+    entry.close();
+
+    if (!firstItem) out += ",";
+    firstItem = false;
+    out += "{\"path\":\"";
+    appendJsonEscaped(out, entryPath);
+    out += "\",\"size\":";
+    out += String((unsigned long)sz);
+    out += ",\"isDir\":";
+    out += (isDir ? "true" : "false");
+    out += "}";
+    count++;
+
+    if (isDir) {
+      appendSdTreeJson(entryPath, out, firstItem, depth + 1, count);
+    }
+    entry = dir.openNextFile();
+  }
+  dir.close();
+}
+
+static const char* sdCardTypeLabel() {
+  if (!sdReady) return "NONE";
+  sdcard_type_t t = SD.cardType();
+  if (t == CARD_MMC)  return "MMC";
+  if (t == CARD_SD)   return "SDSC";
+  if (t == CARD_SDHC) return "SDHC";
+  return "UNKNOWN";
+}
+
+void handleSdWebRoot() {
+  sdWebServer.send_P(200, "text/html; charset=utf-8", SD_WEB_HTML);
+}
+
+void handleSdWebInfo() {
+  String json = "{";
+  json += "\"sdReady\":" + String(sdReady ? "true" : "false") + ",";
+  json += "\"cardType\":\"" + String(sdCardTypeLabel()) + "\",";
+  json += "\"totalBytes\":" + String(sdReady ? (unsigned long long)SD.totalBytes() : 0ULL) + ",";
+  json += "\"usedBytes\":" + String(sdReady ? (unsigned long long)SD.usedBytes() : 0ULL) + ",";
+  json += "\"gpsValid\":" + String((gps.location.isValid() && gps.location.age() < 3000) ? "true" : "false") + ",";
+  json += "\"lat\":" + String(gps.location.isValid() ? gps.location.lat() : 0.0, 6) + ",";
+  json += "\"lng\":" + String(gps.location.isValid() ? gps.location.lng() : 0.0, 6) + ",";
+  json += "\"sats\":" + String(gps.satellites.isValid() ? gps.satellites.value() : 0) + ",";
+  json += "\"ev5Hz\":" + String(ev5HzActivated ? "true" : "false") + ",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"rssi\":" + String(WiFi.RSSI());
+  json += "}";
+  sdWebServer.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleSdWebList() {
+  if (!sdReady) {
+    sdWebServer.send(503, "application/json; charset=utf-8", "{\"ok\":false,\"files\":[]}");
+    return;
+  }
+  String json = "{\"ok\":true,\"files\":[";
+  bool firstItem = true;
+  int count = 0;
+  appendSdTreeJson("/", json, firstItem, 0, count);
+  json += "]}";
+  sdWebServer.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleSdWebView() {
+  if (!sdReady) { sdWebServer.send(503, "text/plain", "SD not ready"); return; }
+  String path = sanitizeSdPath(sdWebServer.arg("path"));
+  if (path.length() == 0 || path == "/") { sdWebServer.send(400, "text/plain", "Invalid path"); return; }
+
+  File f = SD.open(path, FILE_READ);
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    sdWebServer.send(404, "text/plain", "File not found");
+    return;
+  }
+
+  size_t fileSize = f.size();
+  size_t limit = sdWebServer.hasArg("limit") ? (size_t)sdWebServer.arg("limit").toInt() : 16384;
+  if (limit == 0 || limit > 32768) limit = 16384;
+
+  size_t offset = 0;
+  if (sdWebServer.hasArg("tail") && sdWebServer.arg("tail") == "1") {
+    offset = (fileSize > limit) ? (fileSize - limit) : 0;
+  } else if (sdWebServer.hasArg("offset")) {
+    offset = (size_t)sdWebServer.arg("offset").toInt();
+    if (offset > fileSize) offset = fileSize;
+  }
+
+  size_t bytesToSend = min(limit, fileSize - offset);
+  if (offset > 0) f.seek(offset, SeekSet);
+
+  sdWebServer.sendHeader("X-File-Size", String((unsigned long)fileSize));
+  sdWebServer.sendHeader("X-Offset", String((unsigned long)offset));
+  sdWebServer.sendHeader("X-Chunk-Size", String((unsigned long)bytesToSend));
+  sdWebServer.setContentLength(bytesToSend);
+  sdWebServer.send(200, "text/plain; charset=utf-8", "");
+
+  char buf[512];
+  size_t remaining = bytesToSend;
+  while (remaining > 0) {
+    while (GPS.available() > 0) gps.encode(GPS.read());
+    size_t toRead = min(sizeof(buf), remaining);
+    size_t n = f.read((uint8_t*)buf, toRead);
+    if (n == 0) break;
+    sdWebServer.sendContent(buf, n);
+    remaining -= n;
+  }
+  f.close();
+}
+
+void handleSdWebDownload() {
+  if (!sdReady) { sdWebServer.send(503, "text/plain", "SD not ready"); return; }
+  String path = sanitizeSdPath(sdWebServer.arg("path"));
+  if (path.length() == 0 || path == "/") { sdWebServer.send(400, "text/plain", "Invalid path"); return; }
+
+  File f = SD.open(path, FILE_READ);
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    sdWebServer.send(404, "text/plain", "File not found");
+    return;
+  }
+
+  int slash = path.lastIndexOf('/');
+  String fileName = (slash >= 0) ? path.substring(slash + 1) : path;
+  sdWebServer.sendHeader("Content-Disposition", "attachment; filename=\"" + fileName + "\"");
+  sdWebServer.streamFile(f, "application/octet-stream");
+  f.close();
+}
+
+void handleSdWebDelete() {
+  if (!sdReady) { sdWebServer.send(503, "text/plain", "SD not ready"); return; }
+  String path = sanitizeSdPath(sdWebServer.arg("path"));
+  if (path.length() == 0 || path == "/") { sdWebServer.send(400, "text/plain", "Invalid path"); return; }
+  if (!SD.exists(path)) { sdWebServer.send(404, "text/plain", "Not found"); return; }
+
+  if (SD.remove(path)) {
+    sdWebServer.send(200, "application/json", "{\"ok\":true}");
+  } else {
+    sdWebServer.send(500, "application/json", "{\"ok\":false}");
+  }
+}
+
+void initSdWebServerIfReady() {
+  if (sdWebStarted || WiFi.status() != WL_CONNECTED) return;
+
+  String base = String(SD_WEB_SECRET_PATH);
+  sdWebServer.on(base.c_str(), HTTP_GET, handleSdWebRoot);
+  sdWebServer.on((base + "/").c_str(), HTTP_GET, handleSdWebRoot);
+  sdWebServer.on((base + "/api/info").c_str(), HTTP_GET, handleSdWebInfo);
+  sdWebServer.on((base + "/api/list").c_str(), HTTP_GET, handleSdWebList);
+  sdWebServer.on((base + "/api/view").c_str(), HTTP_GET, handleSdWebView);
+  sdWebServer.on((base + "/api/download").c_str(), HTTP_GET, handleSdWebDownload);
+  sdWebServer.on((base + "/api/delete").c_str(), HTTP_POST, handleSdWebDelete);
+
+  // ซ่อนจากคนทั่วไป: พาธ "/" หรือพาธอื่นที่ไม่ได้ตั้งไว้จะคืน 404 ทั้งหมด
+  sdWebServer.onNotFound([]() {
+    sdWebServer.send(404, "text/plain", "Not Found");
+  });
+
+  sdWebServer.begin();
+  sdWebStarted = true;
+  Serial.printf("🔐 [Hidden SD Web] http://%s%s\n", WiFi.localIP().toString().c_str(), SD_WEB_SECRET_PATH);
+}
+#endif
+
 // ==================== Setup ====================
 void setup() {
   Serial.begin(115200);
@@ -620,6 +1136,9 @@ void setup() {
     struct tm tmCheck;
     getLocalTime(&tmCheck, 2500);
     injectM8nAssistance();
+    #if SD_WEB_ENABLE
+      initSdWebServerIfReady();
+    #endif
     #if ENABLE_FIREBASE_SYNC
       initFirebaseIfReady();
     #endif
@@ -669,7 +1188,16 @@ void loop() {
     if (!m8nTimeAssisted) {
       injectM8nAssistance();
     }
+    #if SD_WEB_ENABLE
+      initSdWebServerIfReady();
+    #endif
   }
+
+  #if SD_WEB_ENABLE
+    if (sdWebStarted) {
+      sdWebServer.handleClient();
+    }
+  #endif
 
   // 2. เก็บข้อมูลทันทีที่ NEO-M8N ส่งพิกัดใหม่รอบ 5 Hz (ทุก ~200 ms)
   if (gps.location.isUpdated() && millis() - lastSendTime >= 150) {
