@@ -62,10 +62,11 @@ const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXB
 #endif
 
 // ==================== 4. ตั้งค่าขา Pin ====================
-// GPS Module (UART1 ตามโค้ดเดิมของคุณบอส)
-#define GPS_RX_PIN 16
-#define GPS_TX_PIN 17
-#define GPS_BAUD   9600
+// GPS Module (UART1 ตามโค้ดเดิมของคุณบอส — อัปเป็น 115200 bps อัตโนมัติเพื่อรองรับ 5Hz)
+#define GPS_RX_PIN    16
+#define GPS_TX_PIN    17
+#define GPS_INIT_BAUD 9600
+#define GPS_WORK_BAUD 115200
 
 // SD Card Module (VSPI มาตรฐานตามรูปที่คุณบอสต่อ)
 #define SD_CS_PIN   5
@@ -73,9 +74,11 @@ const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXB
 #define SD_MISO_PIN 19
 #define SD_MOSI_PIN 23
 
-// ==================== 5. ความถี่การส่งข้อมูล ====================
-const unsigned long LOG_INTERVAL_MS = 1000;  // 1000 ms = ส่งและบันทึกทุก 1 วินาที
-const unsigned long QUEUE_SYNC_MS   = 10000; // 10000 ms = ตรวจคิวค้างใน SD Card ทุก 10 วินาที
+// ==================== 5. ความถี่การส่งข้อมูล (โหมด 5Hz สำหรับรถ EV) ====================
+const unsigned long LOG_INTERVAL_MS   = 200;   // 200 ms = 5 Hz (5 จุด/วินาที ลง SD Card + Buffer)
+const unsigned long CLOUD_BATCH_MS    = 1000;  // รวบส่ง Batch ขึ้น Supabase ทุก 1 วินาที (ครั้งละ ~5 จุด)
+const unsigned long QUEUE_SYNC_MS     = 10000; // ตรวจคิวค้างใน SD Card ทุก 10 วินาที
+const int           MAX_BATCH_POINTS  = 10;
 
 // ==================== ตัวแปรระบบ ====================
 HardwareSerial GPS(1);
@@ -88,8 +91,13 @@ double cachedLat = 0.0;
 double cachedLng = 0.0;
 bool hasCachedPos = false;
 unsigned long lastSendTime = 0;
+unsigned long lastCloudBatchTime = 0;
 unsigned long lastQueueSyncTime = 0;
 unsigned long lastCacheSaveTime = 0;
+
+String cloudBatchJson = "";
+int cloudBatchCount = 0;
+String lastLoggedIso = "";
 
 const char* CSV_LOG_FILE   = "/gps_log.csv";
 const char* QUEUE_FILE     = "/offline_queue.jsonl";
@@ -146,31 +154,60 @@ static void writeLE32(uint8_t* buf, int32_t v) {
 }
 
 // ----------------------------------------------------------------------------
-// ปรับจูน u-blox NEO-M8N โหมดความแม่นยำสูงสุดด้วย Hardware อย่างเดียว:
-// 1) CFG-RATE = 1 Hz (1000 ms) สัญญาณนิ่งที่สุดและไม่ล้น 9600 baud
-// 2) CFG-NAV5 (mask=0x0117): 3D Only + MinElev 10° (กันสัญญาณสะท้อนกำแพง) + pDOP<=8.0 + C/N0>=18dBHz
+// ปรับจูน u-blox NEO-M8N สำหรับรถ EV ความถี่ 5 Hz + ความแม่นยำสูงสุด:
+// 1) CFG-PRT  = สลับ UART1 เป็น 115200 bps (UBX+NMEA) กันข้อมูล 5Hz ล้น Serial
+// 2) CFG-RATE = 5 Hz (200 ms) เก็บเส้นโค้งและอัตราเร่งรถ EV เนียนละเอียด
+// 3) CFG-NAV5 = Automotive (4) + 3D Only + MinElev 10° + pDOP<=8.0 + C/N0>=18dBHz
 // ----------------------------------------------------------------------------
-void configureNeoM8nHighAccuracy() {
-  // 1. CFG-RATE (0x06, 0x08): measRate = 1000ms (0x03E8), navRate = 1, timeRef = GPS(1)
-  uint8_t cfgRate[6] = { 0xE8, 0x03, 0x01, 0x00, 0x01, 0x00 };
+void initNeoM8nBaud115200() {
+  uint8_t cfgPrt[20] = {0};
+  cfgPrt[0]  = 0x01; // portID: 1 = UART1
+  // mode = 0x000008D0 (8N1)
+  cfgPrt[4]  = 0xD0;
+  cfgPrt[5]  = 0x08;
+  // baudRate = 115200 (0x0001C200 little-endian)
+  cfgPrt[8]  = 0x00;
+  cfgPrt[9]  = 0xC2;
+  cfgPrt[10] = 0x01;
+  cfgPrt[11] = 0x00;
+  // inProtoMask = 0x0003 (UBX + NMEA), outProtoMask = 0x0003 (UBX + NMEA)
+  cfgPrt[12] = 0x03;
+  cfgPrt[14] = 0x03;
+
+  GPS.setRxBufferSize(2048);
+  GPS.begin(GPS_INIT_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  delay(500);
+  sendUBXPacket(0x06, 0x00, cfgPrt, sizeof(cfgPrt));
+  delay(120);
+
+  GPS.end();
+  delay(50);
+  GPS.setRxBufferSize(2048);
+  GPS.begin(GPS_WORK_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  delay(150);
+}
+
+void configureNeoM8nEv5Hz() {
+  // 1. CFG-RATE (0x06, 0x08): measRate = 200ms (0x00C8 = 5 Hz), navRate = 1, timeRef = GPS(1)
+  uint8_t cfgRate[6] = { 0xC8, 0x00, 0x01, 0x00, 0x01, 0x00 };
   sendUBXPacket(0x06, 0x08, cfgRate, sizeof(cfgRate));
   delay(80);
 
   // 2. CFG-NAV5 (0x06, 0x24): mask = 0x0117 (dyn | minEl | posFixMode | posMask | cnoThreshold)
   uint8_t cfgNav5[36] = {0};
-  cfgNav5[0]  = 0x17; // mask LSB (0x0001 | 0x0002 | 0x0004 | 0x0010)
-  cfgNav5[1]  = 0x01; // mask MSB (0x0100 = cnoThreshold)
-  cfgNav5[2]  = 0;    // dynModel: 0 = Portable (สมดุลและแม่นยำทั้งเดินและเคลื่อนที่)
+  cfgNav5[0]  = 0x17; // mask LSB
+  cfgNav5[1]  = 0x01; // mask MSB
+  cfgNav5[2]  = 4;    // dynModel: 4 = Automotive (เหมาะกับรถ EV เข้าโค้ง/เร่งความเร็ว)
   cfgNav5[3]  = 2;    // fixMode:  2 = 3D Only (ไม่เอาค่า 2D ที่เพี้ยนสูง)
-  cfgNav5[12] = 10;   // minElev:  10° (ตัดดาวเทียมมุมต่ำที่เกิดสัญญาณสะท้อน Multipath)
-  writeLE16(&cfgNav5[14], 80); // pDop: 8.0 (scale 0.1)
+  cfgNav5[12] = 10;   // minElev:  10° (ตัดดาวเทียมมุมต่ำลด Multipath จากอาคารข้างทาง)
+  writeLE16(&cfgNav5[14], 80); // pDop: 8.0
   writeLE16(&cfgNav5[18], 40); // pAcc: 40 m
   cfgNav5[24] = 4;    // cnoThreshNumSVs: อย่างน้อย 4 ดวง
-  cfgNav5[25] = 18;   // cnoThresh: 18 dBHz (คัดเฉพาะสัญญาณคุณภาพดี)
+  cfgNav5[25] = 18;   // cnoThresh: 18 dBHz
   sendUBXPacket(0x06, 0x24, cfgNav5, sizeof(cfgNav5));
   delay(80);
 
-  Serial.println("🛰️ [NEO-M8N] ตั้งค่าโหมดความแม่นยำสูงสุด (1Hz + 3D Only + MinElev 10° + C/N0>=18dBHz) แล้ว");
+  Serial.println("🏎️ [NEO-M8N EV 5Hz] UART 115200 + 5Hz (200ms) + Automotive + 3D Only + MinElev 10°");
 }
 
 // ----------------------------------------------------------------------------
@@ -250,6 +287,8 @@ DeviceDateTime getDeviceDateTime() {
     int min   = gps.time.minute();
     int sec   = gps.time.second();
 
+    int cs    = gps.time.centisecond();
+
     if (hour >= 24) {
       hour -= 24;
       day += 1;
@@ -263,10 +302,10 @@ DeviceDateTime getDeviceDateTime() {
       }
     }
 
-    char dateBuf[16], timeBuf[16], isoBuf[32];
+    char dateBuf[16], timeBuf[20], isoBuf[36];
     snprintf(dateBuf, sizeof(dateBuf), "%04d-%02d-%02d", year, month, day);
-    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d", hour, min, sec);
-    snprintf(isoBuf, sizeof(isoBuf), "%sT%s+07:00", dateBuf, timeBuf);
+    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d:%02d.%02d", hour, min, sec, cs);
+    snprintf(isoBuf, sizeof(isoBuf), "%sT%02d:%02d:%02d.%02d0+07:00", dateBuf, hour, min, sec, cs);
 
     dt.dateTH = String(dateBuf);
     dt.timeTH = String(timeBuf);
@@ -520,11 +559,9 @@ void setup() {
     }
   }
 
-  // GPS Setup (UART1: Pin 16=RX, 17=TX) + ปรับจูน NEO-M8N โหมดความแม่นยำสูงสุด
-  GPS.setRxBufferSize(1024);
-  GPS.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  delay(800);
-  configureNeoM8nHighAccuracy();
+  // GPS Setup (UART1: Pin 16=RX, 17=TX) -> สลับ Baud เป็น 115200 และเปิด 5Hz โหมดรถ EV
+  initNeoM8nBaud115200();
+  configureNeoM8nEv5Hz();
 
   // เริ่มต้น SD Card (ใช้งานได้ทันทีแม้ไม่มี Wi-Fi)
   initSDCard();
@@ -553,6 +590,17 @@ void setup() {
   }
 }
 
+void flushCloudBatch() {
+  if (cloudBatchCount == 0 || cloudBatchJson.length() == 0) return;
+  String arrayPayload = "[" + cloudBatchJson + "]";
+  cloudBatchJson = "";
+  cloudBatchCount = 0;
+
+  if (!sendToSupabase(arrayPayload)) {
+    enqueueOfflinePayload(arrayPayload);
+  }
+}
+
 // ==================== Loop ====================
 void loop() {
   // 1. อ่านค่าจาก GPS ตลอดเวลา (ห้ามใส่ delay เด็ดขาด เพื่อไม่ให้ Buffer เต็ม)
@@ -568,60 +616,75 @@ void loop() {
     injectM8nAssistance();
   }
 
-  // 2. เช็กเวลาทุกๆ 1 วินาที (รับเฉพาะค่า 3D Hardware Fix ที่ผ่านเกณฑ์ Sats >= 4 และ HDOP <= 3.5)
-  if (millis() - lastSendTime >= LOG_INTERVAL_MS) {
+  // 2. เก็บข้อมูลทันทีที่ NEO-M8N ส่งพิกัดใหม่รอบ 5 Hz (ทุก ~200 ms) และผ่านเกณฑ์ Sats >= 4, HDOP <= 3.5
+  if (gps.location.isUpdated() && millis() - lastSendTime >= 150) {
     lastSendTime = millis();
 
     int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
     double hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9;
 
-    if (gps.location.isValid() && gps.location.age() < 2500 && sats >= 4 && hdop <= 3.5) {
+    if (gps.location.isValid() && gps.location.age() < 1500 && sats >= 4 && hdop <= 3.5) {
       double lat      = gps.location.lat();
       double lng      = gps.location.lng();
       double speedKmh = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
       double acc      = hdop * 2.5; // NEO-M8N ~2.5m CEP UERE x HDOP
       DeviceDateTime dt = getDeviceDateTime();
 
-      // บันทึกพิกัดจริงลง Flash เพื่อช่วย Warm Start รอบหน้า (ครั้งแรกทันที หรือทุก 60 วิ)
-      if (!hasCachedPos || millis() - lastCacheSaveTime >= 60000) {
-        lastCacheSaveTime = millis();
-        saveCachedPosition(lat, lng);
-      }
+      if (dt.isoTH.length() == 0 || dt.isoTH != lastLoggedIso) {
+        if (dt.isoTH.length() > 0) lastLoggedIso = dt.isoTH;
 
-      Serial.printf("GPS Fix -> Lat: %.6f, Lng: %.6f, Speed: %.1f km/h, Sats: %d, HDOP: %.2f, Time: %s\n",
-                    lat, lng, speedKmh, sats, hdop, dt.timeTH.c_str());
-
-      // ส่งเข้า Supabase (ต้องมี ISO Timestamp จริงจาก GPS หรือ NTP เพื่อกันชนคิว)
-      bool synced = false;
-      if (dt.hasRealDate && dt.isoTH.length() > 0) {
-        String jsonPayload = "{";
-        jsonPayload += "\"device_id\":\"" + String(SUPABASE_DEVICE_ID) + "\",";
-        jsonPayload += "\"latitude\":" + String(lat, 6) + ",";
-        jsonPayload += "\"longitude\":" + String(lng, 6) + ",";
-        jsonPayload += "\"speed\":" + String(speedKmh, 1) + ",";
-        jsonPayload += "\"accuracy\":" + String(acc, 1) + ",";
-        jsonPayload += "\"source\":\"iot\",";
-        jsonPayload += "\"device_time\":\"" + dt.isoTH + "\"";
-        jsonPayload += "}";
-
-        synced = sendToSupabase(jsonPayload);
-        if (!synced) {
-          enqueueOfflinePayload(jsonPayload);
+        // บันทึกพิกัดจริงลง Flash เพื่อช่วย Warm Start รอบหน้า (ครั้งแรกทันที หรือทุก 60 วิ)
+        if (!hasCachedPos || millis() - lastCacheSaveTime >= 60000) {
+          lastCacheSaveTime = millis();
+          saveCachedPosition(lat, lng);
         }
+
+        Serial.printf("[5Hz] Lat: %.6f, Lng: %.6f, Speed: %.1f km/h, Sats: %d, HDOP: %.2f, Time: %s\n",
+                      lat, lng, speedKmh, sats, hdop, dt.timeTH.c_str());
+
+        // เก็บลง Buffer Batch สำหรับส่งขึ้น Supabase (ทุก 1 วินาที / ครั้งละ ~5 จุด)
+        if (dt.hasRealDate && dt.isoTH.length() > 0) {
+          String itemJson = "{";
+          itemJson += "\"device_id\":\"" + String(SUPABASE_DEVICE_ID) + "\",";
+          itemJson += "\"latitude\":" + String(lat, 6) + ",";
+          itemJson += "\"longitude\":" + String(lng, 6) + ",";
+          itemJson += "\"speed\":" + String(speedKmh, 1) + ",";
+          itemJson += "\"accuracy\":" + String(acc, 1) + ",";
+          itemJson += "\"source\":\"iot\",";
+          itemJson += "\"device_time\":\"" + dt.isoTH + "\"";
+          itemJson += "}";
+
+          if (cloudBatchCount > 0) cloudBatchJson += ",";
+          cloudBatchJson += itemJson;
+          cloudBatchCount++;
+          if (cloudBatchCount >= MAX_BATCH_POINTS) {
+            flushCloudBatch();
+            lastCloudBatchTime = millis();
+          }
+        }
+
+        // บันทึก 5Hz ทุกจุดลง SD Card CSV ทันที
+        appendCSVLog(dt, lat, lng, speedKmh, acc, sats, WiFi.status() == WL_CONNECTED);
+
+        #if ENABLE_FIREBASE_SYNC
+          sendToFirebase(lat, lng, speedKmh, acc, dt.timeTH);
+        #endif
       }
-
-      // บันทึกลง SD Card CSV ทุกจุด
-      appendCSVLog(dt, lat, lng, speedKmh, acc, sats, synced);
-
-      // อัปเดตเข้า Firebase RTDB ด้วย (ถ้าเปิด ENABLE_FIREBASE_SYNC)
-      #if ENABLE_FIREBASE_SYNC
-        sendToFirebase(lat, lng, speedKmh, acc, dt.timeTH);
-      #endif
     } else if (gps.location.isValid()) {
       Serial.printf("⚠️ [Quality Gate] คัดกรองสัญญาณแกว่งออก (Sats: %d, HDOP: %.2f)\n", sats, hdop);
     } else {
       Serial.printf("กำลังค้นหาสัญญาณดาวเทียม (NEO-M8N Sats: %d)...\n", sats);
     }
+  } else if (!gps.location.isValid() && millis() - lastSendTime >= 2000) {
+    lastSendTime = millis();
+    int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
+    Serial.printf("กำลังค้นหาสัญญาณดาวเทียม (NEO-M8N Sats: %d)...\n", sats);
+  }
+
+  // 2.5 รวบส่ง Batch ขึ้น Supabase ทุกๆ 1 วินาที (~5 จุดต่อ 1 HTTP Request)
+  if (millis() - lastCloudBatchTime >= CLOUD_BATCH_MS) {
+    lastCloudBatchTime = millis();
+    flushCloudBatch();
   }
 
   // 3. ทยอยส่งคิว Offline ที่ค้างบน SD Card เมื่อ Wi-Fi กลับมา
