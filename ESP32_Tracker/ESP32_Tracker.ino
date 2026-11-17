@@ -154,37 +154,53 @@ static void writeLE32(uint8_t* buf, int32_t v) {
 }
 
 // ----------------------------------------------------------------------------
-// ปรับจูน u-blox NEO-M8N สำหรับรถ EV ความถี่ 5 Hz + ความแม่นยำสูงสุด:
-// 1) CFG-PRT  = สลับ UART1 เป็น 115200 bps (UBX+NMEA) กันข้อมูล 5Hz ล้น Serial
-// 2) CFG-RATE = 5 Hz (200 ms) เก็บเส้นโค้งและอัตราเร่งรถ EV เนียนละเอียด
-// 3) CFG-NAV5 = Automotive (4) + 3D Only + MinElev 10° + pDOP<=8.0 + C/N0>=18dBHz
+// ตรวจจับและสลับ UART GPS เป็น 115200 bps อัตโนมัติ (หากโมดูลไม่รองรับจะถอยกลับ 9600 ให้เอง)
 // ----------------------------------------------------------------------------
-void initNeoM8nBaud115200() {
+bool testGpsNmeaStream(unsigned long listenMs) {
+  unsigned long start = millis();
+  unsigned long prevPassed = gps.passedChecksum();
+  int dollarCount = 0;
+  while (millis() - start < listenMs) {
+    while (GPS.available() > 0) {
+      char ch = (char)GPS.read();
+      if (ch == '$') dollarCount++;
+      gps.encode(ch);
+    }
+    delay(5);
+  }
+  return (gps.passedChecksum() > prevPassed) || (dollarCount >= 2);
+}
+
+void initNeoM8nBaudAuto() {
+  GPS.setRxBufferSize(2048);
+  GPS.begin(GPS_INIT_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  delay(400);
+
   uint8_t cfgPrt[20] = {0};
   cfgPrt[0]  = 0x01; // portID: 1 = UART1
-  // mode = 0x000008D0 (8N1)
-  cfgPrt[4]  = 0xD0;
+  cfgPrt[4]  = 0xD0; // mode = 8N1
   cfgPrt[5]  = 0x08;
-  // baudRate = 115200 (0x0001C200 little-endian)
-  cfgPrt[8]  = 0x00;
+  cfgPrt[8]  = 0x00; // baudRate = 115200 (0x0001C200)
   cfgPrt[9]  = 0xC2;
   cfgPrt[10] = 0x01;
   cfgPrt[11] = 0x00;
-  // inProtoMask = 0x0003 (UBX + NMEA), outProtoMask = 0x0003 (UBX + NMEA)
-  cfgPrt[12] = 0x03;
-  cfgPrt[14] = 0x03;
+  cfgPrt[12] = 0x03; // inProtoMask = UBX + NMEA
+  cfgPrt[14] = 0x03; // outProtoMask = UBX + NMEA
 
-  GPS.setRxBufferSize(2048);
-  GPS.begin(GPS_INIT_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  delay(500);
   sendUBXPacket(0x06, 0x00, cfgPrt, sizeof(cfgPrt));
   delay(120);
 
-  GPS.end();
-  delay(50);
-  GPS.setRxBufferSize(2048);
-  GPS.begin(GPS_WORK_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  delay(150);
+  // สลับเป็น 115200 แล้วทดสอบว่ามีข้อมูล NMEA เข้ามาจริงหรือไม่ (ไม่ใช้ GPS.end() เพื่อไม่ให้ RX หลุด)
+  GPS.updateBaudRate(GPS_WORK_BAUD);
+  while (GPS.available() > 0) GPS.read();
+
+  if (testGpsNmeaStream(1100)) {
+    Serial.println("✅ [GPS UART] เชื่อมต่อที่ 115200 bps สำเร็จ (รองรับ 5Hz เต็ม)");
+  } else {
+    GPS.updateBaudRate(GPS_INIT_BAUD);
+    while (GPS.available() > 0) GPS.read();
+    Serial.println("⚠️ [GPS UART] โมดูลตอบสนองที่ 9600 bps (ถอยกลับ 9600 อัตโนมัติเพื่อไม่ให้สัญญาณหาย)");
+  }
 }
 
 void configureNeoM8nEv5Hz() {
@@ -193,21 +209,20 @@ void configureNeoM8nEv5Hz() {
   sendUBXPacket(0x06, 0x08, cfgRate, sizeof(cfgRate));
   delay(80);
 
-  // 2. CFG-NAV5 (0x06, 0x24): mask = 0x0117 (dyn | minEl | posFixMode | posMask | cnoThreshold)
+  // 2. CFG-NAV5 (0x06, 0x24): mask = 0x0107 (dyn | minEl | posFixMode | cnoThreshold)
+  // เปิด Auto 2D/3D + MinElev 5° + cnoThresh=0 เพื่อให้จับสัญญาณไวเหมือนโค้ดเดิมและลื่นในรถ EV
   uint8_t cfgNav5[36] = {0};
-  cfgNav5[0]  = 0x17; // mask LSB
-  cfgNav5[1]  = 0x01; // mask MSB
-  cfgNav5[2]  = 4;    // dynModel: 4 = Automotive (เหมาะกับรถ EV เข้าโค้ง/เร่งความเร็ว)
-  cfgNav5[3]  = 2;    // fixMode:  2 = 3D Only (ไม่เอาค่า 2D ที่เพี้ยนสูง)
-  cfgNav5[12] = 10;   // minElev:  10° (ตัดดาวเทียมมุมต่ำลด Multipath จากอาคารข้างทาง)
-  writeLE16(&cfgNav5[14], 80); // pDop: 8.0
-  writeLE16(&cfgNav5[18], 40); // pAcc: 40 m
-  cfgNav5[24] = 4;    // cnoThreshNumSVs: อย่างน้อย 4 ดวง
-  cfgNav5[25] = 18;   // cnoThresh: 18 dBHz
+  cfgNav5[0]  = 0x07; // mask LSB (dyn | minEl | posFixMode)
+  cfgNav5[1]  = 0x01; // mask MSB (cnoThreshold)
+  cfgNav5[2]  = 4;    // dynModel: 4 = Automotive (เหมาะกับรถ EV)
+  cfgNav5[3]  = 3;    // fixMode:  3 = Auto 2D/3D (จับไวแม้ตอนพึ่งออกจากอาคาร/ใต้ร่ม)
+  cfgNav5[12] = 5;    // minElev:  5°
+  cfgNav5[24] = 0;    // cnoThreshNumSVs = 0
+  cfgNav5[25] = 0;    // cnoThresh = 0 dBHz (ไม่ตัดดาวเทียมสัญญาณอ่อนทิ้ง)
   sendUBXPacket(0x06, 0x24, cfgNav5, sizeof(cfgNav5));
   delay(80);
 
-  Serial.println("🏎️ [NEO-M8N EV 5Hz] UART 115200 + 5Hz (200ms) + Automotive + 3D Only + MinElev 10°");
+  Serial.println("🏎️ [NEO-M8N EV 5Hz] ตั้งค่า 5Hz + Automotive + Auto 2D/3D (จับไว) แล้ว");
 }
 
 // ----------------------------------------------------------------------------
@@ -559,8 +574,8 @@ void setup() {
     }
   }
 
-  // GPS Setup (UART1: Pin 16=RX, 17=TX) -> สลับ Baud เป็น 115200 และเปิด 5Hz โหมดรถ EV
-  initNeoM8nBaud115200();
+  // GPS Setup (UART1: Pin 16=RX, 17=TX) -> ตรวจ Baud อัตโนมัติ (115200 / fallback 9600) และเปิด 5Hz EV
+  initNeoM8nBaudAuto();
   configureNeoM8nEv5Hz();
 
   // เริ่มต้น SD Card (ใช้งานได้ทันทีแม้ไม่มี Wi-Fi)
@@ -616,14 +631,14 @@ void loop() {
     injectM8nAssistance();
   }
 
-  // 2. เก็บข้อมูลทันทีที่ NEO-M8N ส่งพิกัดใหม่รอบ 5 Hz (ทุก ~200 ms) และผ่านเกณฑ์ Sats >= 4, HDOP <= 3.5
+  // 2. เก็บข้อมูลทันทีที่ NEO-M8N ส่งพิกัดใหม่รอบ 5 Hz (ทุก ~200 ms)
   if (gps.location.isUpdated() && millis() - lastSendTime >= 150) {
     lastSendTime = millis();
 
     int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
-    double hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 99.9;
+    double hdop = gps.hdop.isValid() ? gps.hdop.hdop() : 5.0;
 
-    if (gps.location.isValid() && gps.location.age() < 1500 && sats >= 4 && hdop <= 3.5) {
+    if (gps.location.isValid() && gps.location.age() < 3000) {
       double lat      = gps.location.lat();
       double lng      = gps.location.lng();
       double speedKmh = gps.speed.isValid() ? gps.speed.kmph() : 0.0;
@@ -670,15 +685,15 @@ void loop() {
           sendToFirebase(lat, lng, speedKmh, acc, dt.timeTH);
         #endif
       }
-    } else if (gps.location.isValid()) {
-      Serial.printf("⚠️ [Quality Gate] คัดกรองสัญญาณแกว่งออก (Sats: %d, HDOP: %.2f)\n", sats, hdop);
     } else {
-      Serial.printf("กำลังค้นหาสัญญาณดาวเทียม (NEO-M8N Sats: %d)...\n", sats);
+      Serial.printf("กำลังค้นหาสัญญาณดาวเทียม (NEO-M8N Sats: %d | Chars: %lu | Passed: %lu)...\n",
+                    sats, gps.charsProcessed(), gps.passedChecksum());
     }
   } else if (!gps.location.isValid() && millis() - lastSendTime >= 2000) {
     lastSendTime = millis();
     int sats = gps.satellites.isValid() ? gps.satellites.value() : 0;
-    Serial.printf("กำลังค้นหาสัญญาณดาวเทียม (NEO-M8N Sats: %d)...\n", sats);
+    Serial.printf("กำลังค้นหาสัญญาณดาวเทียม (NEO-M8N Sats: %d | Chars: %lu | Passed: %lu)...\n",
+                  sats, gps.charsProcessed(), gps.passedChecksum());
   }
 
   // 2.5 รวบส่ง Batch ขึ้น Supabase ทุกๆ 1 วินาที (~5 จุดต่อ 1 HTTP Request)
