@@ -90,6 +90,7 @@ Preferences prefs;
 bool sdReady = false;
 bool m8nTimeAssisted = false;
 bool ev5HzActivated = false;
+bool ntpConfigured = false;
 double cachedLat = 0.0;
 double cachedLng = 0.0;
 bool hasCachedPos = false;
@@ -97,6 +98,7 @@ unsigned long lastSendTime = 0;
 unsigned long lastCloudBatchTime = 0;
 unsigned long lastQueueSyncTime = 0;
 unsigned long lastCacheSaveTime = 0;
+unsigned long lastWifiRetryTime = 0;
 
 String cloudBatchJson = "";
 int cloudBatchCount = 0;
@@ -601,7 +603,9 @@ void setup() {
 
   // ต่อ Wi-Fi แบบไม่ค้างตลอดกาล (รอสูงสุด 8 วินาที)
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  lastWifiRetryTime = millis();
   Serial.print("Connecting to WiFi");
   unsigned long wifiStart = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 8000) {
@@ -612,6 +616,7 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\n✔ WiFi Connected! IP: " + WiFi.localIP().toString());
     configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+    ntpConfigured = true;
     struct tm tmCheck;
     getLocalTime(&tmCheck, 2500);
     injectM8nAssistance();
@@ -648,12 +653,22 @@ void loop() {
     gps.encode(GPS.read());
   }
 
-  // พยายามเชื่อม Wi-Fi อัตโนมัติเมื่อหลุด และฉีดเวลา Warm Start หากเพิ่งต่อติด
-  if (WiFi.status() != WL_CONNECTED && millis() % 15000 < 30) {
-    WiFi.reconnect();
-  }
-  if (WiFi.status() == WL_CONNECTED && !m8nTimeAssisted) {
-    injectM8nAssistance();
+  // พยายามเชื่อม Wi-Fi ใหม่แบบเว้นระยะ 20 วินาที (ไม่ยิง WiFi.reconnect() ซ้ำทุก ms จน error)
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastWifiRetryTime >= 20000) {
+      lastWifiRetryTime = millis();
+      Serial.println("🔄 [WiFi] กำลังลองเชื่อมต่อใหม่...");
+      WiFi.disconnect(false, false);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+  } else {
+    if (!ntpConfigured) {
+      configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+      ntpConfigured = true;
+    }
+    if (!m8nTimeAssisted) {
+      injectM8nAssistance();
+    }
   }
 
   // 2. เก็บข้อมูลทันทีที่ NEO-M8N ส่งพิกัดใหม่รอบ 5 Hz (ทุก ~200 ms)
