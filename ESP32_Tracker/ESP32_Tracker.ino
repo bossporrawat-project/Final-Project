@@ -391,6 +391,21 @@ DeviceDateTime getDeviceDateTime() {
 // ----------------------------------------------------------------------------
 // ฟังก์ชันเริ่มต้นใช้งาน SD Card (VSPI: CS=5, SCK=18, MISO=19, MOSI=23)
 // ----------------------------------------------------------------------------
+static String lastVerifiedCsvPath = "";
+
+void ensureCsvHeader(const String& csvPath) {
+  if (csvPath == lastVerifiedCsvPath) return;
+  if (!SD.exists(csvPath)) {
+    File file = SD.open(csvPath, FILE_WRITE);
+    if (file) {
+      file.println("device_id,recorded_date,recorded_time,device_time_iso,latitude,longitude,speed_kmh,accuracy_m,satellites,synced_supabase");
+      file.close();
+      Serial.printf("📄 [SD Card] สร้างไฟล์ %s เรียบร้อย\n", csvPath.c_str());
+    }
+  }
+  lastVerifiedCsvPath = csvPath;
+}
+
 void initSDCard() {
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   if (!SD.begin(SD_CS_PIN)) {
@@ -401,20 +416,17 @@ void initSDCard() {
 
   sdReady = true;
   Serial.println("✅ [SD Card] เชื่อมต่อสำเร็จ!");
-
-  if (!SD.exists(CSV_LOG_FILE)) {
-    File file = SD.open(CSV_LOG_FILE, FILE_WRITE);
-    if (file) {
-      file.println("device_id,recorded_date,recorded_time,device_time_iso,latitude,longitude,speed_kmh,accuracy_m,satellites,synced_supabase");
-      file.close();
-      Serial.println("📄 [SD Card] สร้างไฟล์ /gps_log.csv เรียบร้อย");
-    }
-  }
 }
 
 void appendCSVLog(const DeviceDateTime& dt, double lat, double lng, double speedKmh, double acc, int sats, bool synced) {
   if (!sdReady) return;
-  File file = SD.open(CSV_LOG_FILE, FILE_APPEND);
+  // แยกไฟล์ CSV ตามวันที่จริงอัตโนมัติ (เช่น /gps_2026-11-18.csv) เพื่อให้ดูย้อนหลังง่าย
+  String csvPath = (dt.hasRealDate && dt.dateTH.length() >= 10)
+                     ? ("/gps_" + dt.dateTH + ".csv")
+                     : String(CSV_LOG_FILE);
+  ensureCsvHeader(csvPath);
+
+  File file = SD.open(csvPath, FILE_APPEND);
   if (!file) return;
 
   String line = String(SUPABASE_DEVICE_ID) + "," +
@@ -557,7 +569,7 @@ void initFirebaseIfReady() {
   firebaseInitialized = true;
 }
 
-void sendToFirebase(double lat, double lng, double speedKmh, double acc, const String& timeStr) {
+void sendToFirebase(double lat, double lng, double speedKmh, double acc, const DeviceDateTime& dt) {
   if (!firebaseInitialized) initFirebaseIfReady();
   if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
     FirebaseJson json;
@@ -566,7 +578,9 @@ void sendToFirebase(double lat, double lng, double speedKmh, double acc, const S
     json.set("lng", lng);
     json.set("speed", speedKmh);
     json.set("accuracy", acc);
-    json.set("time", timeStr);
+    json.set("date", dt.dateTH);
+    json.set("time", dt.timeTH);
+    json.set("device_time", dt.isoTH);
 
     String pathLog = "/gps_log/" + String(FIREBASE_DEVICE_ID);
     if (Firebase.RTDB.pushJSON(&fbdo, pathLog, &json)) {
@@ -724,7 +738,8 @@ async function loadFiles(){
     files = d.files || [];
     renderFiles();
     if(!curFile){
-      const pref = files.find(f => !f.isDir && f.path === '/gps_log.csv') || files.find(f => !f.isDir);
+      const csvs = files.filter(f => !f.isDir && f.path.endsWith('.csv')).sort((a,b)=>b.path.localeCompare(a.path));
+      const pref = csvs[0] || files.find(f => !f.isDir);
       if(pref) selectFile(pref.path, true);
     }
   }catch(e){
@@ -1267,8 +1282,8 @@ void loop() {
           saveCachedPosition(lat, lng);
         }
 
-        Serial.printf("[5Hz] Lat: %.6f, Lng: %.6f, Speed: %.1f km/h, Sats: %d, HDOP: %.2f, Time: %s\n",
-                      lat, lng, speedKmh, sats, hdop, dt.timeTH.c_str());
+        Serial.printf("[5Hz] Lat: %.6f, Lng: %.6f, Speed: %.1f km/h, Sats: %d, HDOP: %.2f, Date: %s, Time: %s\n",
+                      lat, lng, speedKmh, sats, hdop, dt.dateTH.c_str(), dt.timeTH.c_str());
 
         // เก็บลง Buffer Batch สำหรับส่งขึ้น Supabase (ทุก 1 วินาที / ครั้งละ ~5 จุด)
         if (dt.hasRealDate && dt.isoTH.length() > 0) {
@@ -1295,7 +1310,7 @@ void loop() {
         appendCSVLog(dt, lat, lng, speedKmh, acc, sats, WiFi.status() == WL_CONNECTED);
 
         #if ENABLE_FIREBASE_SYNC
-          sendToFirebase(lat, lng, speedKmh, acc, dt.timeTH);
+          sendToFirebase(lat, lng, speedKmh, acc, dt);
         #endif
       }
     } else {
