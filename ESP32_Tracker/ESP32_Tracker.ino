@@ -1092,6 +1092,40 @@ void initSdWebServerIfReady() {
 }
 #endif
 
+bool scanAndReportWifiTarget() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  delay(100);
+
+  Serial.println("🔍 [WiFi Scan] กำลังสแกนหาสัญญาณ Wi-Fi 2.4GHz รอบตัว...");
+  int found = WiFi.scanNetworks(false, false, false, 120);
+  bool targetFound = false;
+
+  if (found <= 0) {
+    Serial.println("⚠️ [WiFi Scan] ไม่พบคลื่น Wi-Fi 2.4GHz รอบข้างเลย");
+  } else {
+    Serial.printf("📶 [WiFi Scan] พบคลื่น 2.4GHz ทั้งหมด %d เครือข่าย:\n", found);
+    int showCount = min(found, 10);
+    for (int i = 0; i < found; i++) {
+      String ssid = WiFi.SSID(i);
+      int32_t rssi = WiFi.RSSI(i);
+      int32_t ch = WiFi.channel(i);
+      if (ssid == String(WIFI_SSID)) {
+        targetFound = true;
+        Serial.printf("   ✅ เจอเป้าหมาย \"%s\" (RSSI: %d dBm, Ch: %d)\n", ssid.c_str(), (int)rssi, (int)ch);
+      } else if (i < showCount) {
+        Serial.printf("   - %s (%d dBm, Ch: %d)\n", ssid.c_str(), (int)rssi, (int)ch);
+      }
+    }
+    if (!targetFound) {
+      Serial.printf("❌ [WiFi Scan] ไม่พบชื่อ \"%s\" บนคลื่น 2.4GHz (อาจปิด Hotspot อยู่ หรือเปิดเฉพาะ 5GHz)\n", WIFI_SSID);
+    }
+  }
+
+  WiFi.scanDelete();
+  return targetFound;
+}
+
 // ==================== Setup ====================
 void setup() {
   Serial.begin(115200);
@@ -1117,16 +1151,21 @@ void setup() {
   // เริ่มต้น SD Card (ใช้งานได้ทันทีแม้ไม่มี Wi-Fi)
   initSDCard();
 
-  // ต่อ Wi-Fi แบบไม่ค้างตลอดกาล (รอสูงสุด 8 วินาที)
-  WiFi.mode(WIFI_STA);
+  // สแกนเช็กก่อนว่าเจอ Wi-Fi เป้าหมาย ("Boss") ในระยะ 2.4GHz หรือไม่ แล้วค่อยเชื่อมต่อ
+  bool wifiTargetFound = scanAndReportWifiTarget();
+
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   lastWifiRetryTime = millis();
-  Serial.print("Connecting to WiFi");
-  unsigned long wifiStart = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 8000) {
-    delay(400);
-    Serial.print(".");
+  if (wifiTargetFound) {
+    Serial.print("Connecting to WiFi");
+    unsigned long wifiStart = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 8000) {
+      delay(400);
+      Serial.print(".");
+    }
+  } else {
+    delay(300);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
