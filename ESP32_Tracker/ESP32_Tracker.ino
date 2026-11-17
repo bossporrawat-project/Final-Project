@@ -1172,13 +1172,16 @@ void loop() {
     gps.encode(GPS.read());
   }
 
-  // พยายามเชื่อม Wi-Fi ใหม่แบบเว้นระยะ 20 วินาที (ไม่ยิง WiFi.reconnect() ซ้ำทุก ms จน error)
+  // ปล่อยให้ AutoReconnect ของ ESP32 ทำงานเบื้องหลัง ไม่เรียก WiFi.begin() ชนตอนกำลังเชื่อม
   if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastWifiRetryTime >= 20000) {
+    if (millis() - lastWifiRetryTime >= 30000) {
       lastWifiRetryTime = millis();
-      Serial.println("🔄 [WiFi] กำลังลองเชื่อมต่อใหม่...");
-      WiFi.disconnect(false, false);
-      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      wl_status_t st = WiFi.status();
+      if (st == WL_CONNECT_FAILED || st == WL_STOPPED) {
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      }
+      Serial.printf("📡 [WiFi] รอเชื่อม \"%s\" (2.4GHz, status=%d) — บันทึกลง SD Card ต่อเนื่อง\n",
+                    WIFI_SSID, (int)st);
     }
   } else {
     if (!ntpConfigured) {
