@@ -29,8 +29,8 @@
 #include <SD.h>
 #include <time.h>
 
-// ตั้งเป็น 1 เพื่อส่งขึ้น Firebase RTDB ควบคู่กับ Supabase (0 = ส่งเฉพาะ Supabase + SD Card)
-#define ENABLE_FIREBASE_SYNC 1
+// ตั้งเป็น 0 = ปิด Firebase ส่งตรงเข้า Supabase + SD Card เท่านั้น (Compile & Upload เร็วขึ้นมาก)
+#define ENABLE_FIREBASE_SYNC 0
 
 #if ENABLE_FIREBASE_SYNC
   #include <Firebase_ESP_Client.h>
@@ -234,31 +234,51 @@ void enqueueOfflinePayload(const String& jsonPayload) {
 }
 
 // ----------------------------------------------------------------------------
-// ส่งเข้า Supabase (gps_history -> Trigger ซิงก์ไป gps_positions อัตโนมัติ)
+// ส่งเข้า Supabase แบบ Keep-Alive (gps_history -> Trigger ซิงก์ไป gps_positions)
 // ----------------------------------------------------------------------------
+WiFiClientSecure supaClient;
+HTTPClient supaHttp;
+bool supaHttpStarted = false;
+
+bool postSupabaseOnce(const String& jsonPayload, int& outCode) {
+  if (!supaHttpStarted) {
+    supaClient.setInsecure();
+    supaHttp.setReuse(true);
+    supaHttp.setTimeout(3500);
+    String endpoint = String(SUPABASE_URL) + "/rest/v1/gps_history?on_conflict=device_id,device_time";
+    if (!supaHttp.begin(supaClient, endpoint)) return false;
+    supaHttpStarted = true;
+  }
+
+  supaHttp.addHeader("Content-Type", "application/json");
+  supaHttp.addHeader("apikey", SUPABASE_KEY);
+  supaHttp.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+  supaHttp.addHeader("Prefer", "resolution=merge-duplicates,return=minimal");
+
+  outCode = supaHttp.POST(jsonPayload);
+  return outCode >= 200 && outCode < 300;
+}
+
 bool sendToSupabase(const String& jsonPayload) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  WiFiClientSecure client;
-  client.setInsecure();
-
-  HTTPClient http;
-  http.setTimeout(3500);
-  String endpoint = String(SUPABASE_URL) + "/rest/v1/gps_history?on_conflict=device_id,device_time";
-  if (!http.begin(client, endpoint)) return false;
-
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("apikey", SUPABASE_KEY);
-  http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
-  http.addHeader("Prefer", "resolution=merge-duplicates,return=minimal");
-
-  int httpCode = http.POST(jsonPayload);
-  http.end();
-
-  if (httpCode >= 200 && httpCode < 300) {
+  int httpCode = -1;
+  if (postSupabaseOnce(jsonPayload, httpCode)) {
     Serial.printf("☁️ [Supabase] ส่งข้อมูลสำเร็จ (HTTP %d)\n", httpCode);
     return true;
   }
+
+  // หาก Keep-Alive Socket หลุดหรือหมดอายุ ให้รีเซ็ต Connection แล้วลองส่งใหม่อีก 1 ครั้ง
+  if (httpCode <= 0) {
+    supaHttp.end();
+    supaClient.stop();
+    supaHttpStarted = false;
+    if (postSupabaseOnce(jsonPayload, httpCode)) {
+      Serial.printf("☁️ [Supabase] ส่งข้อมูลสำเร็จหลังเชื่อมต่อใหม่ (HTTP %d)\n", httpCode);
+      return true;
+    }
+  }
+
   Serial.printf("⚠️ [Supabase] ส่งไม่สำเร็จ (HTTP %d)\n", httpCode);
   return false;
 }
