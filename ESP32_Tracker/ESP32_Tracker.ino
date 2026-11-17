@@ -123,6 +123,7 @@ String lastLoggedIso = "";
 const char* CSV_LOG_FILE   = "/gps_log.csv";
 const char* QUEUE_FILE     = "/offline_queue.jsonl";
 const char* QUEUE_TMP_FILE = "/offline_queue_tmp.jsonl";
+const char* QUEUE_BAD_FILE = "/offline_bad.jsonl";
 
 struct DeviceDateTime {
   String dateTH;   // YYYY-MM-DD (UTC+7)
@@ -471,7 +472,7 @@ WiFiClientSecure supaClient;
 HTTPClient supaHttp;
 bool supaHttpStarted = false;
 
-bool postSupabaseOnce(const String& jsonPayload, int& outCode) {
+bool postSupabaseOnce(const String& jsonPayload, int& outCode, String& outErr) {
   if (!supaHttpStarted) {
     supaClient.setInsecure();
     supaHttp.setReuse(true);
@@ -487,16 +488,23 @@ bool postSupabaseOnce(const String& jsonPayload, int& outCode) {
   supaHttp.addHeader("Prefer", "resolution=merge-duplicates,return=minimal");
 
   outCode = supaHttp.POST(jsonPayload);
-  return outCode >= 200 && outCode < 300;
+  if (outCode >= 200 && outCode < 300) {
+    return true;
+  }
+  if (outCode >= 400) {
+    outErr = supaHttp.getString();
+  }
+  return false;
 }
 
-bool sendToSupabase(const String& jsonPayload) {
-  if (WiFi.status() != WL_CONNECTED) return false;
+int sendToSupabaseStatus(const String& jsonPayload) {
+  if (WiFi.status() != WL_CONNECTED) return 0;
 
   int httpCode = -1;
-  if (postSupabaseOnce(jsonPayload, httpCode)) {
+  String errBody = "";
+  if (postSupabaseOnce(jsonPayload, httpCode, errBody)) {
     Serial.printf("☁️ [Supabase] ส่งข้อมูลสำเร็จ (HTTP %d)\n", httpCode);
-    return true;
+    return httpCode;
   }
 
   // หาก Keep-Alive Socket หลุดหรือหมดอายุ ให้รีเซ็ต Connection แล้วลองส่งใหม่อีก 1 ครั้ง
@@ -504,14 +512,24 @@ bool sendToSupabase(const String& jsonPayload) {
     supaHttp.end();
     supaClient.stop();
     supaHttpStarted = false;
-    if (postSupabaseOnce(jsonPayload, httpCode)) {
+    errBody = "";
+    if (postSupabaseOnce(jsonPayload, httpCode, errBody)) {
       Serial.printf("☁️ [Supabase] ส่งข้อมูลสำเร็จหลังเชื่อมต่อใหม่ (HTTP %d)\n", httpCode);
-      return true;
+      return httpCode;
     }
   }
 
-  Serial.printf("⚠️ [Supabase] ส่งไม่สำเร็จ (HTTP %d)\n", httpCode);
-  return false;
+  if (errBody.length() > 0) {
+    Serial.printf("⚠️ [Supabase] ส่งไม่สำเร็จ (HTTP %d): %s\n", httpCode, errBody.c_str());
+  } else {
+    Serial.printf("⚠️ [Supabase] ส่งไม่สำเร็จ (HTTP %d)\n", httpCode);
+  }
+  return httpCode;
+}
+
+bool sendToSupabase(const String& jsonPayload) {
+  int code = sendToSupabaseStatus(jsonPayload);
+  return code >= 200 && code < 300;
 }
 
 void flushOfflineQueue() {
@@ -529,7 +547,9 @@ void flushOfflineQueue() {
 
   Serial.println("🔄 [Offline Queue] พบข้อมูลค้างใน SD Card กำลังทยอยส่งขึ้น Supabase...");
   File tmpFile = SD.open(QUEUE_TMP_FILE, FILE_WRITE);
+  int attemptCount = 0;
   int sentCount = 0;
+  int badCount = 0;
   int remainCount = 0;
 
   while (qFile.available()) {
@@ -540,12 +560,27 @@ void flushOfflineQueue() {
     line.trim();
     if (line.length() == 0) continue;
 
-    if (sentCount < 5 && sendToSupabase(line)) {
-      sentCount++;
-    } else {
-      if (tmpFile) tmpFile.println(line);
-      remainCount++;
+    if (attemptCount < 5) {
+      attemptCount++;
+      int code = sendToSupabaseStatus(line);
+      if (code >= 200 && code < 300) {
+        sentCount++;
+        continue;
+      }
+      // 4xx ถาวร (เช่น JSON พัง หรือ key ซ้ำใน Batch เก่า) ย้ายออกไม่ให้บล็อกคิวที่เหลือ
+      if (code >= 400 && code < 500 && code != 408 && code != 429) {
+        File badFile = SD.open(QUEUE_BAD_FILE, FILE_APPEND);
+        if (badFile) {
+          badFile.println(line);
+          badFile.close();
+        }
+        badCount++;
+        continue;
+      }
     }
+
+    if (tmpFile) tmpFile.println(line);
+    remainCount++;
   }
 
   qFile.close();
@@ -554,10 +589,12 @@ void flushOfflineQueue() {
   SD.remove(QUEUE_FILE);
   if (remainCount > 0) {
     SD.rename(QUEUE_TMP_FILE, QUEUE_FILE);
-    Serial.printf("📌 [Offline Queue] ส่งสำเร็จ %d รายการ, เหลือ %d รายการ\n", sentCount, remainCount);
+    Serial.printf("📌 [Offline Queue] ส่งสำเร็จ %d, ย้ายคิวเสีย %d, เหลือรอส่ง %d รายการ\n",
+                  sentCount, badCount, remainCount);
   } else {
     SD.remove(QUEUE_TMP_FILE);
-    Serial.printf("🎉 [Offline Queue] ซิงก์ข้อมูลย้อนหลังครบทั้งหมด %d รายการ!\n", sentCount);
+    Serial.printf("🎉 [Offline Queue] เคลียร์คิวบน SD Card เรียบร้อย (สำเร็จ %d, คิวเสีย %d)\n",
+                  sentCount, badCount);
   }
 }
 
@@ -1335,8 +1372,8 @@ void loop() {
         Serial.printf("[5Hz] Lat: %.6f, Lng: %.6f, Speed: %.1f km/h, Sats: %d, HDOP: %.2f, Date: %s, Time: %s\n",
                       lat, lng, speedKmh, sats, hdop, dt.dateTH.c_str(), dt.timeTH.c_str());
 
-        // เก็บลง Buffer Batch สำหรับส่งขึ้น Supabase (ทุก 1 วินาที / ครั้งละ ~5 จุด)
-        if (dt.hasRealDate && dt.isoTH.length() > 0) {
+        // เก็บลง Buffer Batch สำหรับส่งขึ้น Supabase (ทุก 1 วินาที / ครั้งละ ~5 จุด และกัน timestamp ซ้ำในชุดเดียว)
+        if (dt.hasRealDate && dt.isoTH.length() > 0 && cloudBatchJson.indexOf("\"" + dt.isoTH + "\"") < 0) {
           String itemJson = "{";
           itemJson += "\"device_id\":\"" + String(SUPABASE_DEVICE_ID) + "\",";
           itemJson += "\"latitude\":" + String(lat, 6) + ",";
