@@ -415,10 +415,14 @@ void ensureCsvHeader(const String& csvPath) {
 
 void initSDCard() {
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  if (!SD.begin(SD_CS_PIN)) {
-    Serial.println("⚠️ [SD Card] ไม่พบโมดูล SD Card หรือการ์ดยังไม่ได้เสียบ (ลองเช็กไฟเลี้ยง 5V VIN)");
-    sdReady = false;
-    return;
+  if (!SD.begin(SD_CS_PIN, SPI, 4000000)) {
+    delay(100);
+    if (!SD.begin(SD_CS_PIN, SPI, 1000000)) {
+      Serial.println("⚠️ [SD Card] ไม่พบโมดูล SD Card หรือการ์ดยังไม่ได้เสียบ");
+      Serial.println("   เช็กสาย 6 เส้น: VCC->VIN(5V) | GND->GND | CS->5 | SCK->18 | MISO->19 | MOSI->23");
+      sdReady = false;
+      return;
+    }
   }
 
   sdReady = true;
