@@ -125,10 +125,16 @@ unsigned long lastCloudBatchTime = 0;
 unsigned long lastQueueSyncTime = 0;
 unsigned long lastCacheSaveTime = 0;
 unsigned long lastWifiRetryTime = 0;
+unsigned long lastSdFlushTime = 0;
+unsigned long lastSdRecoverTime = 0;
 
 String cloudBatchJson = "";
 int cloudBatchCount = 0;
 String lastLoggedIso = "";
+
+String sdCsvBuffer = "";
+String sdCsvTargetPath = "";
+int sdCsvBufferedCount = 0;
 
 const char* CSV_LOG_FILE   = "/gps_log.csv";
 const char* QUEUE_FILE     = "/offline_queue.jsonl";
@@ -413,45 +419,111 @@ DeviceDateTime getDeviceDateTime() {
 // ----------------------------------------------------------------------------
 static String lastVerifiedCsvPath = "";
 
-void ensureCsvHeader(const String& csvPath) {
-  if (csvPath == lastVerifiedCsvPath) return;
-  if (!SD.exists(csvPath)) {
-    File file = SD.open(csvPath, FILE_WRITE);
-    if (file) {
-      file.println("device_id,recorded_date,recorded_time,device_time_iso,latitude,longitude,speed_kmh,accuracy_m,satellites,synced_supabase");
-      file.close();
-      Serial.printf("📄 [SD Card] สร้างไฟล์ %s เรียบร้อย\n", csvPath.c_str());
+bool mountSdOnce() {
+  pinMode(SD_CS_PIN, OUTPUT);
+  digitalWrite(SD_CS_PIN, HIGH);
+  pinMode(SD_MISO_PIN, INPUT_PULLUP);
+  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+
+  // ใช้ SPI 2MHz / 1MHz เพื่อความเสถียรกับสายจัมเปอร์และลดปัญหาหลุดตอน Wi-Fi ยิงสัญญาณ
+  if (!SD.begin(SD_CS_PIN, SPI, 2000000)) {
+    delay(60);
+    if (!SD.begin(SD_CS_PIN, SPI, 1000000)) {
+      sdReady = false;
+      return false;
     }
   }
+  sdReady = true;
+  return true;
+}
+
+bool recoverSDCard() {
+  if (millis() - lastSdRecoverTime < 5000) return sdReady;
+  lastSdRecoverTime = millis();
+  Serial.println("🔄 [SD Card] ตรวจพบการหลุด/เขียนไม่ผ่าน -> กำลังรีเซ็ตเชื่อมต่อใหม่อัตโนมัติ...");
+  SD.end();
+  lastVerifiedCsvPath = "";
+  delay(40);
+  if (mountSdOnce()) {
+    Serial.println("✅ [SD Card] กู้คืนการเชื่อมต่อสำเร็จ!");
+    return true;
+  }
+  Serial.println("⚠️ [SD Card] ยังกู้คืนไม่สำเร็จ (เช็กไฟ 5V VIN / ขา 5,18,19,23)");
+  return false;
+}
+
+bool ensureCsvHeader(const String& csvPath) {
+  if (csvPath == lastVerifiedCsvPath) return true;
+  if (!SD.exists(csvPath)) {
+    File file = SD.open(csvPath, FILE_WRITE);
+    if (!file) return false;
+    size_t w = file.println("device_id,recorded_date,recorded_time,device_time_iso,latitude,longitude,speed_kmh,accuracy_m,satellites,synced_supabase");
+    file.close();
+    if (w == 0) return false;
+    Serial.printf("📄 [SD Card] สร้างไฟล์ %s เรียบร้อย\n", csvPath.c_str());
+  }
   lastVerifiedCsvPath = csvPath;
+  return true;
 }
 
 void initSDCard() {
-  SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  if (!SD.begin(SD_CS_PIN, SPI, 4000000)) {
-    delay(100);
-    if (!SD.begin(SD_CS_PIN, SPI, 1000000)) {
-      Serial.println("⚠️ [SD Card] ไม่พบโมดูล SD Card หรือการ์ดยังไม่ได้เสียบ");
-      Serial.println("   เช็กสาย 6 เส้น: VCC->VIN(5V) | GND->GND | CS->5 | SCK->18 | MISO->19 | MOSI->23");
-      sdReady = false;
-      return;
+  if (!mountSdOnce()) {
+    Serial.println("⚠️ [SD Card] ไม่พบโมดูล SD Card หรือการ์ดยังไม่ได้เสียบ");
+    Serial.println("   เช็กสาย 6 เส้น: VCC->VIN(5V) | GND->GND | CS->5 | SCK->18 | MISO->19 | MOSI->23");
+    return;
+  }
+  Serial.println("✅ [SD Card] เชื่อมต่อสำเร็จ (SPI Stable Mode)!");
+}
+
+bool writeSdCsvChunk(const String& path, const String& payload) {
+  if (!ensureCsvHeader(path)) return false;
+  File file = SD.open(path, FILE_APPEND);
+  if (!file) return false;
+  size_t w = file.print(payload);
+  file.flush();
+  file.close();
+  return w == payload.length();
+}
+
+void flushSDCsvBuffer() {
+  lastSdFlushTime = millis();
+  if (sdCsvBufferedCount == 0 || sdCsvBuffer.length() == 0) return;
+
+  if (!sdReady && !recoverSDCard()) {
+    if (sdCsvBuffer.length() > 8192) {
+      sdCsvBuffer = "";
+      sdCsvBufferedCount = 0;
     }
+    return;
   }
 
-  sdReady = true;
-  Serial.println("✅ [SD Card] เชื่อมต่อสำเร็จ!");
+  if (!writeSdCsvChunk(sdCsvTargetPath, sdCsvBuffer)) {
+    if (recoverSDCard() && writeSdCsvChunk(sdCsvTargetPath, sdCsvBuffer)) {
+      sdCsvBuffer = "";
+      sdCsvBufferedCount = 0;
+      return;
+    }
+    if (sdCsvBuffer.length() > 8192) {
+      sdCsvBuffer = "";
+      sdCsvBufferedCount = 0;
+    }
+    return;
+  }
+
+  sdCsvBuffer = "";
+  sdCsvBufferedCount = 0;
 }
 
 void appendCSVLog(const DeviceDateTime& dt, double lat, double lng, double speedKmh, double acc, int sats, bool synced) {
-  if (!sdReady) return;
-  // แยกไฟล์ CSV ตามวันที่จริงอัตโนมัติ (เช่น /gps_2026-11-18.csv) เพื่อให้ดูย้อนหลังง่าย
+  // แยกไฟล์ CSV ตามวันที่จริงอัตโนมัติ (เช่น /gps_2026-11-18.csv) และรวบเขียนลง SD วินาทีละ 1 ครั้ง
   String csvPath = (dt.hasRealDate && dt.dateTH.length() >= 10)
                      ? ("/gps_" + dt.dateTH + ".csv")
                      : String(CSV_LOG_FILE);
-  ensureCsvHeader(csvPath);
 
-  File file = SD.open(csvPath, FILE_APPEND);
-  if (!file) return;
+  if (sdCsvTargetPath.length() > 0 && csvPath != sdCsvTargetPath) {
+    flushSDCsvBuffer();
+  }
+  sdCsvTargetPath = csvPath;
 
   String line = String(SUPABASE_DEVICE_ID) + "," +
                 dt.dateTH + "," +
@@ -462,19 +534,31 @@ void appendCSVLog(const DeviceDateTime& dt, double lat, double lng, double speed
                 String(speedKmh, 1) + "," +
                 String(acc, 1) + "," +
                 String(sats) + "," +
-                (synced ? "1" : "0");
-  file.println(line);
-  file.close();
+                (synced ? "1" : "0") + "\n";
+  sdCsvBuffer += line;
+  sdCsvBufferedCount++;
+
+  if (sdCsvBufferedCount >= 5) {
+    flushSDCsvBuffer();
+  }
 }
 
 void enqueueOfflinePayload(const String& jsonPayload) {
-  if (!sdReady) return;
+  if (!sdReady && !recoverSDCard()) return;
   File file = SD.open(QUEUE_FILE, FILE_APPEND);
-  if (file) {
-    file.println(jsonPayload);
-    file.close();
-    Serial.println("📦 [Offline Queue] พักข้อมูลลง SD Card รอส่งย้อนหลัง");
+  if (!file && recoverSDCard()) {
+    file = SD.open(QUEUE_FILE, FILE_APPEND);
   }
+  if (file) {
+    size_t w = file.println(jsonPayload);
+    file.flush();
+    file.close();
+    if (w > 0) {
+      Serial.println("📦 [Offline Queue] พักข้อมูลลง SD Card รอส่งย้อนหลัง");
+      return;
+    }
+  }
+  Serial.println("⚠️ [SD Card] เขียน Offline Queue ไม่สำเร็จ");
 }
 
 // ----------------------------------------------------------------------------
@@ -545,11 +629,14 @@ bool sendToSupabase(const String& jsonPayload) {
 }
 
 void flushOfflineQueue() {
-  if (!sdReady || WiFi.status() != WL_CONNECTED) return;
+  if ((!sdReady && !recoverSDCard()) || WiFi.status() != WL_CONNECTED) return;
   if (!SD.exists(QUEUE_FILE)) return;
 
   File qFile = SD.open(QUEUE_FILE, FILE_READ);
-  if (!qFile) return;
+  if (!qFile) {
+    recoverSDCard();
+    return;
+  }
 
   if (qFile.size() == 0) {
     qFile.close();
@@ -557,58 +644,109 @@ void flushOfflineQueue() {
     return;
   }
 
+  // อ่านแค่ 5 บรรทัดแรกแล้วปิดไฟล์ทันที ก่อนยิง HTTPS (ไม่เปิดไฟล์ SD ค้างไว้ระหว่าง Wi-Fi TX)
+  String batchLines[5];
+  int batchCodes[5] = {0, 0, 0, 0, 0};
+  int batchCount = 0;
+  size_t resumeOffset = 0;
+
+  while (qFile.available() && batchCount < 5) {
+    String line = qFile.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      batchLines[batchCount++] = line;
+    }
+  }
+  resumeOffset = qFile.position();
+  bool hasTail = qFile.available();
+  qFile.close();
+
+  if (batchCount == 0) {
+    SD.remove(QUEUE_FILE);
+    return;
+  }
+
   Serial.println("🔄 [Offline Queue] พบข้อมูลค้างใน SD Card กำลังทยอยส่งขึ้น Supabase...");
-  File tmpFile = SD.open(QUEUE_TMP_FILE, FILE_WRITE);
-  int attemptCount = 0;
   int sentCount = 0;
   int badCount = 0;
-  int remainCount = 0;
+  int retryCount = 0;
 
-  while (qFile.available()) {
-    // ยังคงรับข้อมูล GPS และคำขอเว็บลับต่อเนื่องระหว่างทยอยส่งคิว
+  for (int i = 0; i < batchCount; i++) {
     while (GPS.available() > 0) gps.encode(GPS.read());
     pumpSdWebClient();
 
-    String line = qFile.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) continue;
-
-    if (attemptCount < 5) {
-      attemptCount++;
-      int code = sendToSupabaseStatus(line);
-      if (code >= 200 && code < 300) {
-        sentCount++;
-        continue;
-      }
-      // 4xx ถาวร (เช่น JSON พัง หรือ key ซ้ำใน Batch เก่า) ย้ายออกไม่ให้บล็อกคิวที่เหลือ
-      if (code >= 400 && code < 500 && code != 408 && code != 429) {
-        File badFile = SD.open(QUEUE_BAD_FILE, FILE_APPEND);
-        if (badFile) {
-          badFile.println(line);
-          badFile.close();
-        }
-        badCount++;
-        continue;
-      }
+    int code = sendToSupabaseStatus(batchLines[i]);
+    batchCodes[i] = code;
+    if (code >= 200 && code < 300) {
+      sentCount++;
+    } else if (code >= 400 && code < 500 && code != 408 && code != 429) {
+      badCount++;
+    } else {
+      retryCount++;
     }
-
-    if (tmpFile) tmpFile.println(line);
-    remainCount++;
   }
 
-  qFile.close();
-  if (tmpFile) tmpFile.close();
+  // ถ้าส่งไม่สำเร็จเพราะเน็ต (ไม่มีอะไรเปลี่ยนและยังต้องเก็บทุกบรรทัด) ไม่ต้องเขียน/ลบไฟล์ซ้ำให้การ์ดสึกหรอ
+  if (sentCount == 0 && badCount == 0) {
+    return;
+  }
 
-  SD.remove(QUEUE_FILE);
-  if (remainCount > 0) {
-    SD.rename(QUEUE_TMP_FILE, QUEUE_FILE);
-    Serial.printf("📌 [Offline Queue] ส่งสำเร็จ %d, ย้ายคิวเสีย %d, เหลือรอส่ง %d รายการ\n",
-                  sentCount, badCount, remainCount);
-  } else {
-    SD.remove(QUEUE_TMP_FILE);
+  if (badCount > 0) {
+    File badFile = SD.open(QUEUE_BAD_FILE, FILE_APPEND);
+    if (badFile) {
+      for (int i = 0; i < batchCount; i++) {
+        int c = batchCodes[i];
+        if (c >= 400 && c < 500 && c != 408 && c != 429) {
+          badFile.println(batchLines[i]);
+        }
+      }
+      badFile.close();
+    }
+  }
+
+  if (retryCount == 0 && !hasTail) {
+    SD.remove(QUEUE_FILE);
     Serial.printf("🎉 [Offline Queue] เคลียร์คิวบน SD Card เรียบร้อย (สำเร็จ %d, คิวเสีย %d)\n",
                   sentCount, badCount);
+    return;
   }
+
+  File tmpFile = SD.open(QUEUE_TMP_FILE, FILE_WRITE);
+  if (!tmpFile) {
+    recoverSDCard();
+    return;
+  }
+
+  for (int i = 0; i < batchCount; i++) {
+    int c = batchCodes[i];
+    bool isOk = (c >= 200 && c < 300);
+    bool isPermanentBad = (c >= 400 && c < 500 && c != 408 && c != 429);
+    if (!isOk && !isPermanentBad) {
+      tmpFile.println(batchLines[i]);
+    }
+  }
+
+  if (hasTail) {
+    File tailSrc = SD.open(QUEUE_FILE, FILE_READ);
+    if (tailSrc) {
+      tailSrc.seek(resumeOffset, SeekSet);
+      uint8_t buf[256];
+      while (tailSrc.available()) {
+        while (GPS.available() > 0) gps.encode(GPS.read());
+        size_t n = tailSrc.read(buf, sizeof(buf));
+        if (n == 0) break;
+        tmpFile.write(buf, n);
+      }
+      tailSrc.close();
+    }
+  }
+  tmpFile.flush();
+  tmpFile.close();
+
+  SD.remove(QUEUE_FILE);
+  SD.rename(QUEUE_TMP_FILE, QUEUE_FILE);
+  Serial.printf("📌 [Offline Queue] รอบนี้ส่งสำเร็จ %d, ย้ายคิวเสีย %d (ทยอยส่งที่เหลือต่อรอบถัดไป)\n",
+                sentCount, badCount);
 }
 
 #if ENABLE_FIREBASE_SYNC
@@ -1041,6 +1179,7 @@ void handleSdWebRoot() {
 }
 
 void handleSdWebInfo() {
+  if (!sdReady) recoverSDCard();
   String json = "{";
   json += "\"sdReady\":" + String(sdReady ? "true" : "false") + ",";
   json += "\"cardType\":\"" + String(sdCardTypeLabel()) + "\",";
@@ -1061,10 +1200,11 @@ void handleSdWebInfo() {
 }
 
 void handleSdWebList() {
-  if (!sdReady) {
+  if (!sdReady && !recoverSDCard()) {
     sdWebServer.send(503, "application/json; charset=utf-8", "{\"ok\":false,\"files\":[]}");
     return;
   }
+  flushSDCsvBuffer();
   String json = "{\"ok\":true,\"files\":[";
   bool firstItem = true;
   int count = 0;
@@ -1444,7 +1584,10 @@ void loop() {
     printGpsSearchStatus(sats);
   }
 
-  // 2.5 รวบส่ง Batch ขึ้น Supabase ทุกๆ 1 วินาที (~5 จุดต่อ 1 HTTP Request)
+  // 2.5 รวบเขียน Buffer 5Hz ลง SD Card และส่ง Batch ขึ้น Supabase ทุกๆ 1 วินาที
+  if (millis() - lastSdFlushTime >= CLOUD_BATCH_MS) {
+    flushSDCsvBuffer();
+  }
   if (millis() - lastCloudBatchTime >= CLOUD_BATCH_MS) {
     lastCloudBatchTime = millis();
     flushCloudBatch();
