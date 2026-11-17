@@ -38,6 +38,12 @@
 #define SD_WEB_PORT        80
 #define SD_WEB_SECRET_PATH "/boss-sd"
 
+// Hotspot ในตัว ESP32 (เปิดอ่าน SD Card ได้แม้ไม่มี Wi-Fi "Boss" อยู่แถวนั้น)
+#define SD_AP_ENABLE       1
+#define SD_AP_SSID         "BOSS_SD_VAULT"
+#define SD_AP_PASSWORD     "Boss2548"   // รหัส WPA2 (อย่างน้อย 8 ตัวอักษร)
+#define SD_AP_HIDDEN       0            // 0 = แสดงชื่อ Wi-Fi ให้เชื่อมง่าย, 1 = ซ่อนชื่อ Wi-Fi (ต้องพิมพ์ชื่อเชื่อมเอง)
+
 #if SD_WEB_ENABLE
   #include <WebServer.h>
 #endif
@@ -52,7 +58,7 @@
 #define WIFI_SSID     "Boss"
 #define WIFI_PASSWORD "Boss2548"
 
-const char* SUPABASE_DEVICE_ID = "ESP32_001"; // ชื่อใน Supabase / หน้าเว็บ Dashboard
+const char* SUPABASE_DEVICE_ID = "IOT_ESP32_001"; // ชื่อใน Supabase / หน้าเว็บ Dashboard
 const char* FIREBASE_DEVICE_ID = "001";       // ชื่อ Node ใน Firebase (/gps_data/001)
 
 // ==================== 2. ตั้งค่า Supabase ====================
@@ -100,6 +106,7 @@ bool sdReady = false;
 bool m8nTimeAssisted = false;
 bool ev5HzActivated = false;
 bool ntpConfigured = false;
+bool staPausedForAp = false;
 double cachedLat = 0.0;
 double cachedLng = 0.0;
 bool hasCachedPos = false;
@@ -606,6 +613,7 @@ void sendToFirebase(double lat, double lng, double speedKmh, double acc, const D
 // ============================================================================
 WebServer sdWebServer(SD_WEB_PORT);
 bool sdWebStarted = false;
+bool staUrlPrinted = false;
 
 static const char SD_WEB_HTML[] PROGMEM = R"BOSS_SD_HTML(<!DOCTYPE html>
 <html lang="th">
@@ -726,7 +734,9 @@ async function loadInfo(){
     document.getElementById('stGps').textContent = d.gpsValid
       ? `${d.lat.toFixed(5)}, ${d.lng.toFixed(5)} | Sats:${d.sats} | ${d.ev5Hz ? '5Hz' : '1Hz'}`
       : `Searching (Sats:${d.sats})`;
-    document.getElementById('stWifi').textContent = `${d.ip} (${d.rssi} dBm)`;
+    document.getElementById('stWifi').textContent = d.staConnected
+      ? `STA ${d.staIp} (${d.rssi} dBm) | AP ${d.apIp}`
+      : `AP Direct ${d.apIp} (${d.apClients} เครื่อง)`;
   }catch(e){}
 }
 
@@ -987,7 +997,10 @@ void handleSdWebInfo() {
   json += "\"lng\":" + String(gps.location.isValid() ? gps.location.lng() : 0.0, 6) + ",";
   json += "\"sats\":" + String(gps.satellites.isValid() ? gps.satellites.value() : 0) + ",";
   json += "\"ev5Hz\":" + String(ev5HzActivated ? "true" : "false") + ",";
-  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"staConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"staIp\":\"" + (WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String("")) + "\",";
+  json += "\"apIp\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"apClients\":" + String((int)WiFi.softAPgetStationNum()) + ",";
   json += "\"rssi\":" + String(WiFi.RSSI());
   json += "}";
   sdWebServer.send(200, "application/json; charset=utf-8", json);
@@ -1085,25 +1098,32 @@ void handleSdWebDelete() {
 }
 
 void initSdWebServerIfReady() {
-  if (sdWebStarted || WiFi.status() != WL_CONNECTED) return;
+  if (!sdWebStarted) {
+    String base = String(SD_WEB_SECRET_PATH);
+    sdWebServer.on(base.c_str(), HTTP_GET, handleSdWebRoot);
+    sdWebServer.on((base + "/").c_str(), HTTP_GET, handleSdWebRoot);
+    sdWebServer.on((base + "/api/info").c_str(), HTTP_GET, handleSdWebInfo);
+    sdWebServer.on((base + "/api/list").c_str(), HTTP_GET, handleSdWebList);
+    sdWebServer.on((base + "/api/view").c_str(), HTTP_GET, handleSdWebView);
+    sdWebServer.on((base + "/api/download").c_str(), HTTP_GET, handleSdWebDownload);
+    sdWebServer.on((base + "/api/delete").c_str(), HTTP_POST, handleSdWebDelete);
 
-  String base = String(SD_WEB_SECRET_PATH);
-  sdWebServer.on(base.c_str(), HTTP_GET, handleSdWebRoot);
-  sdWebServer.on((base + "/").c_str(), HTTP_GET, handleSdWebRoot);
-  sdWebServer.on((base + "/api/info").c_str(), HTTP_GET, handleSdWebInfo);
-  sdWebServer.on((base + "/api/list").c_str(), HTTP_GET, handleSdWebList);
-  sdWebServer.on((base + "/api/view").c_str(), HTTP_GET, handleSdWebView);
-  sdWebServer.on((base + "/api/download").c_str(), HTTP_GET, handleSdWebDownload);
-  sdWebServer.on((base + "/api/delete").c_str(), HTTP_POST, handleSdWebDelete);
+    // ซ่อนจากคนทั่วไป: พาธ "/" หรือพาธอื่นที่ไม่ได้ตั้งไว้จะคืน 404 ทั้งหมด
+    sdWebServer.onNotFound([]() {
+      sdWebServer.send(404, "text/plain", "Not Found");
+    });
 
-  // ซ่อนจากคนทั่วไป: พาธ "/" หรือพาธอื่นที่ไม่ได้ตั้งไว้จะคืน 404 ทั้งหมด
-  sdWebServer.onNotFound([]() {
-    sdWebServer.send(404, "text/plain", "Not Found");
-  });
+    sdWebServer.begin();
+    sdWebStarted = true;
+    #if SD_AP_ENABLE
+      Serial.printf("🔐 [SD Web - Offline AP] http://%s%s\n", WiFi.softAPIP().toString().c_str(), SD_WEB_SECRET_PATH);
+    #endif
+  }
 
-  sdWebServer.begin();
-  sdWebStarted = true;
-  Serial.printf("🔐 [Hidden SD Web] http://%s%s\n", WiFi.localIP().toString().c_str(), SD_WEB_SECRET_PATH);
+  if (WiFi.status() == WL_CONNECTED && !staUrlPrinted) {
+    staUrlPrinted = true;
+    Serial.printf("🔐 [SD Web - WiFi STA]  http://%s%s\n", WiFi.localIP().toString().c_str(), SD_WEB_SECRET_PATH);
+  }
 }
 #endif
 
@@ -1166,8 +1186,18 @@ void setup() {
   // เริ่มต้น SD Card (ใช้งานได้ทันทีแม้ไม่มี Wi-Fi)
   initSDCard();
 
-  // สแกนเช็กก่อนว่าเจอ Wi-Fi เป้าหมาย ("Boss") ในระยะ 2.4GHz หรือไม่ แล้วค่อยเชื่อมต่อ
+  // สแกนเช็กก่อนว่าเจอ Wi-Fi เป้าหมาย ("Boss") ในระยะ 2.4GHz หรือไม่ แล้วเปิด Hotspot ส่วนตัว + STA
   bool wifiTargetFound = scanAndReportWifiTarget();
+
+  #if SD_WEB_ENABLE && SD_AP_ENABLE
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(SD_AP_SSID, SD_AP_PASSWORD, 1, SD_AP_HIDDEN, 4);
+    Serial.printf("📶 [SD AP] เปิด Hotspot ส่วนตัว \"%s\" (Pass: %s) IP: %s\n",
+                  SD_AP_SSID, SD_AP_PASSWORD, WiFi.softAPIP().toString().c_str());
+    initSdWebServerIfReady();
+  #else
+    WiFi.mode(WIFI_STA);
+  #endif
 
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -1197,7 +1227,7 @@ void setup() {
       initFirebaseIfReady();
     #endif
   } else {
-    Serial.println("\n⚠️ WiFi ยังไม่เชื่อมต่อ — บันทึกลง SD Card และรอซิงก์อัตโนมัติเมื่อออนไลน์");
+    Serial.println("\n⚠️ ยังไม่พบ Wi-Fi \"Boss\" — บันทึกลง SD Card และเข้าอ่านผ่าน Hotspot \"" SD_AP_SSID "\" ได้ทันที");
   }
 }
 
@@ -1226,9 +1256,25 @@ void loop() {
     gps.encode(GPS.read());
   }
 
+  // พักสแกน STA ชั่วคราวเมื่อมีเครื่องเกาะ AP เข้ามาอ่าน SD Card (ไม่ให้ AP สะดุด/หลุดตอนสแกนช่อง)
+  #if SD_WEB_ENABLE && SD_AP_ENABLE
+    uint8_t apClients = WiFi.softAPgetStationNum();
+    if (apClients > 0 && WiFi.status() != WL_CONNECTED && !staPausedForAp) {
+      staPausedForAp = true;
+      WiFi.setAutoReconnect(false);
+      WiFi.disconnect(false, false);
+      Serial.println("📱 [SD AP] มีเครื่องเชื่อมเข้ามาอ่าน SD Card (พักสแกน STA ชั่วคราวให้นิ่ง)");
+    } else if (apClients == 0 && staPausedForAp) {
+      staPausedForAp = false;
+      WiFi.setAutoReconnect(true);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+      Serial.println("📡 [WiFi] ผู้ใช้หลุดจาก SD AP แล้ว -> กลับมารอเชื่อม \"Boss\" ต่อ");
+    }
+  #endif
+
   // ปล่อยให้ AutoReconnect ของ ESP32 ทำงานเบื้องหลัง ไม่เรียก WiFi.begin() ชนตอนกำลังเชื่อม
   if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastWifiRetryTime >= 30000) {
+    if (!staPausedForAp && millis() - lastWifiRetryTime >= 30000) {
       lastWifiRetryTime = millis();
       wl_status_t st = WiFi.status();
       if (st == WL_CONNECT_FAILED || st == WL_STOPPED) {
