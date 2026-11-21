@@ -324,16 +324,20 @@ export function computeTelemetryMetrics(
       const nonJumpScore = Math.max(0, 1 - impliedJumpCount / refDeltas.length);
       const validRatio = validPts.length / Math.max(1, points.length);
       dataConsistencyPct = parseFloat((Math.min(100, cadenceScore * nonJumpScore * validRatio * 100)).toFixed(1));
-    }
 
-    const totalSpanSec = (withTime[withTime.length - 1].ms - withTime[0].ms) / 1000;
-    if (totalSpanSec > 0) {
-      const uptimeSec = allDeltasSec
-        .filter((dt) => dt <= 15)
-        .reduce((a, b) => a + b, 0);
-      availabilityPct = parseFloat(Math.min(100, (uptimeSec / totalSpanSec) * 100).toFixed(1));
+      // Active-session availability: exclude multi-minute powered-off breaks (>300s)
+      const activeTotalSec = activeDeltasSec.reduce((a, b) => a + b, 0);
+      if (activeTotalSec > 0) {
+        const uptimeThresholdSec = Math.max(20, medianDt * 2.5);
+        const healthySec = activeDeltasSec
+          .filter((dt) => dt <= uptimeThresholdSec)
+          .reduce((a, b) => a + b, 0);
+        availabilityPct = parseFloat(Math.min(100, (healthySec / activeTotalSec) * 100).toFixed(1));
+      } else {
+        availabilityPct = parseFloat(((validPts.length / Math.max(1, points.length)) * 100).toFixed(1));
+      }
     } else {
-      availabilityPct = 100.0;
+      availabilityPct = validPts.length > 0 ? 100.0 : null;
     }
   } else {
     dataConsistencyPct = parseFloat(((validPts.length / Math.max(1, points.length)) * 100).toFixed(1));
