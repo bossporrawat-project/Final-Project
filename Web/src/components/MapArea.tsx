@@ -28,16 +28,17 @@ interface MapAreaProps {
   liveData?: any[];
   historyData?: any[];
   clearSignal?: number;
+  kmlRoute?: { lat: number; lng: number }[];
 }
 
-export default function MapArea({ stats, theme, liveData = [], historyData = [], clearSignal = 0 }: MapAreaProps) {
+export default function MapArea({ stats, theme, liveData = [], historyData = [], clearSignal = 0, kmlRoute }: MapAreaProps) {
   return (
     <div
       id="map-c"
       className="relative h-[50vh] min-h-[360px] border-b border-[var(--border)]"
       style={{ position: 'relative', height: '50vh', minHeight: '380px', width: '100%' }}
     >
-      <MapComponent theme={theme} liveData={liveData} historyData={historyData} clearSignal={clearSignal} />
+      <MapComponent theme={theme} liveData={liveData} historyData={historyData} clearSignal={clearSignal} kmlRoute={kmlRoute} />
       
       <div className="mst">
         <div className="sc" title="Total Active Devices">

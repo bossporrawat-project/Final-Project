@@ -12,7 +12,16 @@ import { useBrowserGPS } from '@/hooks/useBrowserGPS';
 import { useTraccar } from '@/hooks/useTraccar';
 import { useIoT } from '@/hooks/useIoT';
 import { getSupabaseClient } from '@/lib/supabaseClient';
-import { haversine, AnalysisStats } from '@/utils/calculations';
+import {
+  haversine,
+  AnalysisStats,
+  parseKmlRoute,
+  distancePointToRouteMeters,
+  computeTelemetryMetrics,
+  computeKmlBaselineMetrics,
+  ParsedKmlRoute,
+  RouteComparisonMetrics,
+} from '@/utils/calculations';
 
 const DEFAULT_ANALYSIS_STATS: AnalysisStats = {
   samples: '-',
@@ -35,9 +44,18 @@ function isValidCoord(p?: { latitude?: number; longitude?: number } | null): boo
   );
 }
 
-function computeStatsForPoints(points: Position[], refLatNum: number, refLngNum: number): AnalysisStats {
+function computeStatsForPoints(
+  points: Position[],
+  refLatNum: number,
+  refLngNum: number,
+  kmlPoints?: { lat: number; lng: number }[] | null
+): AnalysisStats {
   if (points.length === 0) return DEFAULT_ANALYSIS_STATS;
-  const errors = points.map(d => haversine(refLatNum, refLngNum, d.latitude, d.longitude));
+  const errors = points.map((d) =>
+    kmlPoints && kmlPoints.length >= 2
+      ? distancePointToRouteMeters(d.latitude, d.longitude, kmlPoints)
+      : haversine(refLatNum, refLngNum, d.latitude, d.longitude)
+  );
   const mean = errors.reduce((a, b) => a + b, 0) / errors.length;
   const stdDev = Math.sqrt(errors.reduce((sq, n) => sq + Math.pow(n - mean, 2), 0) / errors.length);
   const max = Math.max(...errors);
@@ -77,6 +95,7 @@ export default function Dashboard() {
   const [refLat, setRefLat] = useState('');
   const [refLng, setRefLng] = useState('');
   const [analysisTick, setAnalysisTick] = useState(0);
+  const [kmlRoute, setKmlRoute] = useState<ParsedKmlRoute | null>(null);
   const lastHistoryRecordRef = useRef<{ lat: number; lng: number; time: number } | null>(null);
   const lastTraccarRecordRef = useRef<Record<string, { lat: number; lng: number; time: number }>>({});
   const lastIoTRecordRef = useRef<Record<string, { lat: number; lng: number; timeStr: string; time: number }>>({});
@@ -680,6 +699,15 @@ export default function Dashboard() {
       } else {
         statusMsg = '📡 กำลังรอสัญญาณ Browser GPS...';
       }
+    } else if (refMode === 'kml') {
+      if (kmlRoute && kmlRoute.points.length > 0) {
+        const mid = kmlRoute.points[Math.floor(kmlRoute.points.length / 2)];
+        resolvedLat = mid.lat;
+        resolvedLng = mid.lng;
+        statusMsg = `✓ เทียบกับ KML Main Route: "${kmlRoute.name}" (${kmlRoute.points.length} จุด)`;
+      } else {
+        statusMsg = '📂 กรุณาอัปโหลดไฟล์ .kml เส้นทางหลักเพื่อคำนวณเทียบ';
+      }
     } else {
       const latNum = parseFloat(refLat);
       const lngNum = parseFloat(refLng);
@@ -693,11 +721,14 @@ export default function Dashboard() {
     }
 
     return { resolvedLat, resolvedLng, statusMsg, validHist, validLive };
-  }, [analysisTick, refMode, refDeviceId, refLat, refLng, gpsPosition, histArr, liveValues, deviceOptions, serverCentroid, totalHistoryCount]);
+  }, [analysisTick, refMode, refDeviceId, refLat, refLng, gpsPosition, histArr, liveValues, deviceOptions, serverCentroid, totalHistoryCount, kmlRoute]);
 
   // Query server-side million-row SQL analysis RPC whenever Analysis is open and reference changes
   useEffect(() => {
-    if (!isAnalysisOpen || !supabase) return;
+    if (!isAnalysisOpen || !supabase || refMode === 'kml') {
+      setServerDeviceRows(null);
+      return;
+    }
     const { resolvedLat, resolvedLng } = resolvedReference;
     if (resolvedLat === null || resolvedLng === null) {
       setServerDeviceRows(null);
@@ -739,6 +770,7 @@ export default function Dashboard() {
 
   const autoAnalysis = useMemo(() => {
     const { resolvedLat, resolvedLng, statusMsg, validHist, validLive } = resolvedReference;
+    const activeKmlPoints = refMode === 'kml' && kmlRoute ? kmlRoute.points : null;
 
     if (resolvedLat === null || resolvedLng === null) {
       return {
@@ -750,9 +782,27 @@ export default function Dashboard() {
         iotStats: DEFAULT_ANALYSIS_STATS,
         nativeStats: DEFAULT_ANALYSIS_STATS,
         deviceRows: [] as DeviceAnalysisRow[],
+        comparisonMetrics: kmlRoute ? [computeKmlBaselineMetrics(kmlRoute)] : ([] as RouteComparisonMetrics[]),
         bestSummary: null as { label: string; meanError: number; samples: number } | null
       };
     }
+
+    const getSourcePoints = (source: string) => {
+      const fromHist = validHist.filter(d => d.source === source);
+      return fromHist.length > 0 ? fromHist : validLive.filter(d => d.source === source);
+    };
+
+    const byDevice = new Map<string, Position[]>();
+    validHist.forEach(p => {
+      const list = byDevice.get(p.device_id) || [];
+      list.push(p);
+      byDevice.set(p.device_id, list);
+    });
+    validLive.forEach(p => {
+      if (!byDevice.has(p.device_id)) {
+        byDevice.set(p.device_id, [p]);
+      }
+    });
 
     let deviceRows: DeviceAnalysisRow[];
     let bs: AnalysisStats;
@@ -761,8 +811,24 @@ export default function Dashboard() {
     let ns: AnalysisStats;
     let finalStatus = statusMsg;
 
-    if (serverDeviceRows && serverDeviceRows.length > 0) {
-      deviceRows = serverDeviceRows;
+    if (!activeKmlPoints && serverDeviceRows && serverDeviceRows.length > 0) {
+      deviceRows = serverDeviceRows.map(r => {
+        const pts = byDevice.get(r.deviceId) || [];
+        const tm = computeTelemetryMetrics(pts, {
+          id: r.deviceId,
+          label: r.deviceId,
+          source: r.source,
+          overrideAvgErrorM: r.meanError,
+          overrideSamples: r.samples,
+        });
+        return {
+          ...r,
+          updateIntervalS: tm.updateIntervalS,
+          avgSpeedMs: tm.avgSpeedMs,
+          dataConsistencyPct: tm.dataConsistencyPct,
+          availabilityPct: tm.availabilityPct,
+        };
+      });
       const aggregateSource = (src: string): AnalysisStats => {
         const rows = serverDeviceRows.filter(r => r.source === src && r.samples > 0);
         if (rows.length === 0) return DEFAULT_ANALYSIS_STATS;
@@ -798,31 +864,22 @@ export default function Dashboard() {
       const totalAnalyzed = serverDeviceRows.reduce((s, r) => s + r.samples, 0);
       finalStatus = `${statusMsg} • คำนวณ SQL เต็มฐานข้อมูล ${totalAnalyzed.toLocaleString()} แถว`;
     } else {
-      const getSourcePoints = (source: string) => {
-        const fromHist = validHist.filter(d => d.source === source);
-        return fromHist.length > 0 ? fromHist : validLive.filter(d => d.source === source);
-      };
-
-      bs = computeStatsForPoints(getSourcePoints('browser'), resolvedLat, resolvedLng);
-      ts = computeStatsForPoints(getSourcePoints('traccar'), resolvedLat, resolvedLng);
-      is = computeStatsForPoints(getSourcePoints('iot'), resolvedLat, resolvedLng);
-      ns = computeStatsForPoints(getSourcePoints('native'), resolvedLat, resolvedLng);
-
-      const byDevice = new Map<string, Position[]>();
-      validHist.forEach(p => {
-        const list = byDevice.get(p.device_id) || [];
-        list.push(p);
-        byDevice.set(p.device_id, list);
-      });
-      validLive.forEach(p => {
-        if (!byDevice.has(p.device_id)) {
-          byDevice.set(p.device_id, [p]);
-        }
-      });
+      bs = computeStatsForPoints(getSourcePoints('browser'), resolvedLat, resolvedLng, activeKmlPoints);
+      ts = computeStatsForPoints(getSourcePoints('traccar'), resolvedLat, resolvedLng, activeKmlPoints);
+      is = computeStatsForPoints(getSourcePoints('iot'), resolvedLat, resolvedLng, activeKmlPoints);
+      ns = computeStatsForPoints(getSourcePoints('native'), resolvedLat, resolvedLng, activeKmlPoints);
 
       deviceRows = Array.from(byDevice.entries())
         .map(([deviceId, pts]) => {
-          const st = computeStatsForPoints(pts, resolvedLat, resolvedLng);
+          const st = computeStatsForPoints(pts, resolvedLat, resolvedLng, activeKmlPoints);
+          const tm = computeTelemetryMetrics(pts, {
+            id: deviceId,
+            label: deviceId,
+            source: pts[0]?.source || 'unknown',
+            kmlRoute: activeKmlPoints,
+            refLat: resolvedLat,
+            refLng: resolvedLng,
+          });
           return {
             deviceId,
             source: pts[0]?.source || 'unknown',
@@ -831,11 +888,43 @@ export default function Dashboard() {
             stdDev: typeof st.stdDev === 'number' ? st.stdDev : 0,
             min: typeof st.min === 'number' ? st.min : 0,
             max: typeof st.max === 'number' ? st.max : 0,
-            avgAcc: st.avgAcc
+            avgAcc: st.avgAcc,
+            updateIntervalS: tm.updateIntervalS,
+            avgSpeedMs: tm.avgSpeedMs,
+            dataConsistencyPct: tm.dataConsistencyPct,
+            availabilityPct: tm.availabilityPct,
           };
         })
         .filter(r => r.samples > 0)
         .sort((a, b) => a.meanError - b.meanError);
+    }
+
+    const comparisonMetrics: RouteComparisonMetrics[] = [];
+    const sourceColumns: Array<{ src: string; label: string; stats: AnalysisStats }> = [
+      { src: 'iot', label: 'IoT Data', stats: is },
+      { src: 'traccar', label: 'API (Traccar)', stats: ts },
+      { src: 'native', label: 'Native (Android)', stats: ns },
+      { src: 'browser', label: 'Browser GPS', stats: bs },
+    ];
+    for (const col of sourceColumns) {
+      const pts = getSourcePoints(col.src);
+      const hasStats = typeof col.stats.samples === 'number' && col.stats.samples > 0;
+      if (pts.length === 0 && !hasStats) continue;
+      comparisonMetrics.push(
+        computeTelemetryMetrics(pts, {
+          id: `src_${col.src}`,
+          label: col.label,
+          source: col.src,
+          kmlRoute: activeKmlPoints,
+          refLat: resolvedLat,
+          refLng: resolvedLng,
+          overrideAvgErrorM: typeof col.stats.meanError === 'number' ? col.stats.meanError : null,
+          overrideSamples: typeof col.stats.samples === 'number' ? col.stats.samples : null,
+        })
+      );
+    }
+    if (kmlRoute && kmlRoute.points.length > 0) {
+      comparisonMetrics.push(computeKmlBaselineMetrics(kmlRoute));
     }
 
     const maxGlobalError = Math.max(
@@ -880,9 +969,32 @@ export default function Dashboard() {
       iotStats: is,
       nativeStats: ns,
       deviceRows,
+      comparisonMetrics,
       bestSummary
     };
-  }, [resolvedReference, serverDeviceRows, refMode, refLat, refLng]);
+  }, [resolvedReference, serverDeviceRows, refMode, refLat, refLng, kmlRoute]);
+
+  // Analysis Handlers
+  const handleUploadKml = async (file: File) => {
+    try {
+      const text = await file.text();
+      const parsed = parseKmlRoute(text, file.name);
+      if (parsed.points.length === 0) {
+        alert('ไม่พบพิกัดในไฟล์ KML นี้ (รองรับ LineString, gx:Track และ Point)');
+        return;
+      }
+      setKmlRoute(parsed);
+      setRefMode('kml');
+      setAnalysisTick(t => t + 1);
+    } catch (err: any) {
+      alert(err?.message || 'อ่านไฟล์ KML ไม่สำเร็จ');
+    }
+  };
+
+  const handleClearKml = () => {
+    setKmlRoute(null);
+    if (refMode === 'kml') setRefMode('centroid');
+  };
 
   // Analysis Handlers
   const handleSetRefFromGPS = () => {
@@ -991,7 +1103,7 @@ export default function Dashboard() {
         onToggleAnalysis={handleToggleAnalysis}
       />
 
-      <MapArea stats={stats} theme={theme} liveData={filteredLive as any} historyData={filteredHist as any} clearSignal={clearSignal} />
+      <MapArea stats={stats} theme={theme} liveData={filteredLive as any} historyData={filteredHist as any} clearSignal={clearSignal} kmlRoute={kmlRoute?.points} />
       
       <DataTables
         liveData={filteredLive as any}
@@ -1035,6 +1147,10 @@ export default function Dashboard() {
         nativeStats={autoAnalysis.nativeStats}
         deviceRows={autoAnalysis.deviceRows}
         bestSummary={autoAnalysis.bestSummary}
+        kmlRoute={kmlRoute}
+        onUploadKml={handleUploadKml}
+        onClearKml={handleClearKml}
+        comparisonMetrics={autoAnalysis.comparisonMetrics}
       />
     </div>
   );

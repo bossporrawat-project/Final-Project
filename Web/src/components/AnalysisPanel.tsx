@@ -1,9 +1,9 @@
-import React from 'react';
-import { Locate, Activity, Cpu, MapPin, Calculator, FileText, RotateCcw, X, Smartphone, Sparkles, Trophy } from 'lucide-react';
+import React, { useRef } from 'react';
+import { Locate, Activity, Cpu, MapPin, Calculator, FileText, RotateCcw, X, Smartphone, Sparkles, Trophy, Upload, Trash2, Route } from 'lucide-react';
 import { Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, Legend, Tooltip } from 'recharts';
-import { AnalysisStats } from '@/utils/calculations';
+import { AnalysisStats, ParsedKmlRoute, RouteComparisonMetrics } from '@/utils/calculations';
 
-export type ReferenceMode = 'centroid' | 'device' | 'gps' | 'manual';
+export type ReferenceMode = 'centroid' | 'device' | 'gps' | 'manual' | 'kml';
 
 export interface DeviceAnalysisRow {
   deviceId: string;
@@ -14,6 +14,10 @@ export interface DeviceAnalysisRow {
   min: number;
   max: number;
   avgAcc: number | string;
+  updateIntervalS?: number | null;
+  avgSpeedMs?: number | null;
+  dataConsistencyPct?: number | null;
+  availabilityPct?: number | null;
 }
 
 interface AnalysisPanelProps {
@@ -39,6 +43,10 @@ interface AnalysisPanelProps {
   nativeStats?: AnalysisStats;
   deviceRows: DeviceAnalysisRow[];
   bestSummary: { label: string; meanError: number; samples: number } | null;
+  kmlRoute?: ParsedKmlRoute | null;
+  onUploadKml?: (file: File) => void;
+  onClearKml?: () => void;
+  comparisonMetrics?: RouteComparisonMetrics[];
 }
 
 export default function AnalysisPanel({
@@ -64,7 +72,12 @@ export default function AnalysisPanel({
   nativeStats,
   deviceRows,
   bestSummary,
+  kmlRoute = null,
+  onUploadKml,
+  onClearKml,
+  comparisonMetrics = [],
 }: AnalysisPanelProps) {
+  const kmlInputRef = useRef<HTMLInputElement | null>(null);
 
   const chartData = [
     {
@@ -153,7 +166,63 @@ export default function AnalysisPanel({
               >
                 กำหนดเอง
               </button>
+              <button
+                type="button"
+                className={modeBtnClass(refMode === 'kml')}
+                onClick={() => {
+                  onRefModeChange('kml');
+                  if (!kmlRoute) kmlInputRef.current?.click();
+                }}
+              >
+                <span className="inline-flex items-center gap-1"><Route size={12} /> KML Main Route</span>
+              </button>
             </div>
+
+            {onUploadKml && (
+              <div className="mb-3 flex flex-wrap items-center gap-2 rounded border border-[var(--border)] bg-[var(--bg-primary)]/70 px-2.5 py-2 text-xs">
+                <input
+                  ref={kmlInputRef}
+                  type="file"
+                  accept=".kml"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) onUploadKml(f);
+                    e.target.value = '';
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => kmlInputRef.current?.click()}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded border border-[#FACC15]/50 bg-[#FACC15]/10 text-[#FACC15] font-semibold hover:bg-[#FACC15]/20 transition-colors"
+                >
+                  <Upload size={12} /> {kmlRoute ? 'เปลี่ยนไฟล์ .kml' : 'อัปโหลด .kml (Main Route)'}
+                </button>
+                {kmlRoute ? (
+                  <>
+                    <span className="text-[var(--text-2)] truncate max-w-[210px]" title={kmlRoute.name}>
+                      ✓ {kmlRoute.name} ({kmlRoute.points.length} จุด •{' '}
+                      {kmlRoute.totalDistanceM >= 1000
+                        ? `${(kmlRoute.totalDistanceM / 1000).toFixed(2)} km`
+                        : `${Math.round(kmlRoute.totalDistanceM)} m`}
+                      )
+                    </span>
+                    {onClearKml && (
+                      <button
+                        type="button"
+                        onClick={onClearKml}
+                        className="ml-auto text-rose-400 hover:text-rose-300 inline-flex items-center gap-1"
+                        title="ลบเส้นทาง KML"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    )}
+                  </>
+                ) : (
+                  <span className="text-[var(--text-3)]">อัปโหลดไฟล์เส้นทาง KML เพื่อเทียบ Error บนเส้นทางจริง</span>
+                )}
+              </div>
+            )}
 
             {refMode === 'device' && (
               <div className="mb-3">
@@ -313,6 +382,80 @@ export default function AnalysisPanel({
             </div>
           </div>
 
+          {comparisonMetrics.length > 0 && (
+            <div className="ana-card mb-4">
+              <div className="ana-card-title justify-between">
+                <span className="flex items-center gap-2">
+                  <Route size={16} className="text-[#FACC15]" />
+                  <span>Route &amp; Telemetry Benchmark Matrix</span>
+                </span>
+                <span className="text-xs font-normal text-[var(--text-3)]">
+                  {kmlRoute ? `อ้างอิงเส้นทางหลัก: ${kmlRoute.name}` : 'อ้างอิง Reference Point'}
+                </span>
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead className="text-left border-b border-[var(--border)] text-[var(--text-2)]">
+                    <tr>
+                      <th className="py-2 pr-4 font-bold">Metric</th>
+                      {comparisonMetrics.map((col) => (
+                        <th key={col.id} className="py-2 px-3 text-center font-bold whitespace-nowrap">
+                          {col.label}
+                        </th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr className="border-b border-[var(--row-alt)] bg-[var(--bg-primary)]/40">
+                      <td className="py-2.5 pr-4 font-semibold text-[var(--text-1)] whitespace-nowrap">
+                        Accuracy (Avg Error on Main Route)
+                      </td>
+                      {comparisonMetrics.map((col) => (
+                        <td key={col.id} className="py-2.5 px-3 text-center font-inter font-bold text-[#10B981]">
+                          {col.avgErrorM != null ? `${col.avgErrorM.toFixed(2)} m` : '—'}
+                        </td>
+                      ))}
+                    </tr>
+                    <tr className="border-b border-[var(--row-alt)]">
+                      <td className="py-2.5 pr-4 font-semibold text-[var(--text-1)] whitespace-nowrap">Update Interval</td>
+                      {comparisonMetrics.map((col) => (
+                        <td key={col.id} className="py-2.5 px-3 text-center font-inter text-[var(--text-2)]">
+                          {col.updateIntervalS != null
+                            ? `${col.updateIntervalS.toFixed(2)} s${col.isSimulated ? ' (Simulated)' : ''}`
+                            : '—'}
+                        </td>
+                      ))}
+                    </tr>
+                    <tr className="border-b border-[var(--row-alt)] bg-[var(--bg-primary)]/40">
+                      <td className="py-2.5 pr-4 font-semibold text-[var(--text-1)] whitespace-nowrap">Average Speed</td>
+                      {comparisonMetrics.map((col) => (
+                        <td key={col.id} className="py-2.5 px-3 text-center font-inter text-[#F59E0B]">
+                          {col.avgSpeedMs != null ? `${col.avgSpeedMs.toFixed(2)} m/s` : '—'}
+                        </td>
+                      ))}
+                    </tr>
+                    <tr className="border-b border-[var(--row-alt)]">
+                      <td className="py-2.5 pr-4 font-semibold text-[var(--text-1)] whitespace-nowrap">Data Consistency</td>
+                      {comparisonMetrics.map((col) => (
+                        <td key={col.id} className="py-2.5 px-3 text-center font-inter text-[#06B6D4]">
+                          {col.dataConsistencyPct != null ? `${col.dataConsistencyPct.toFixed(1)}%` : '—'}
+                        </td>
+                      ))}
+                    </tr>
+                    <tr className="bg-[var(--bg-primary)]/40">
+                      <td className="py-2.5 pr-4 font-semibold text-[var(--text-1)] whitespace-nowrap">Availability / Uptime</td>
+                      {comparisonMetrics.map((col) => (
+                        <td key={col.id} className="py-2.5 px-3 text-center font-inter text-[var(--text-1)]">
+                          {col.availabilityPct != null ? `${col.availabilityPct.toFixed(1)}%` : '—'}
+                        </td>
+                      ))}
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
           {deviceRows.length > 0 && (
             <div className="ana-card">
               <div className="ana-card-title justify-between">
@@ -330,6 +473,10 @@ export default function AnalysisPanel({
                       <th className="py-2 pr-3">Mean Error</th>
                       <th className="py-2 pr-3">Std Dev</th>
                       <th className="py-2 pr-3">Min / Max</th>
+                      <th className="py-2 pr-3">Interval</th>
+                      <th className="py-2 pr-3">Avg Speed</th>
+                      <th className="py-2 pr-3">Consistency</th>
+                      <th className="py-2 pr-3">Uptime</th>
                       <th className="py-2">Avg Acc</th>
                     </tr>
                   </thead>
@@ -343,6 +490,10 @@ export default function AnalysisPanel({
                         <td className="py-2 pr-3 font-inter font-bold text-[#10B981]">{row.meanError} m</td>
                         <td className="py-2 pr-3 font-inter">{row.stdDev} m</td>
                         <td className="py-2 pr-3 font-inter text-[var(--text-2)]">{row.min} / {row.max} m</td>
+                        <td className="py-2 pr-3 font-inter text-[var(--text-2)]">{row.updateIntervalS != null ? `${row.updateIntervalS.toFixed(2)} s` : '—'}</td>
+                        <td className="py-2 pr-3 font-inter text-[#F59E0B]">{row.avgSpeedMs != null ? `${row.avgSpeedMs.toFixed(2)} m/s` : '—'}</td>
+                        <td className="py-2 pr-3 font-inter text-[#06B6D4]">{row.dataConsistencyPct != null ? `${row.dataConsistencyPct.toFixed(1)}%` : '—'}</td>
+                        <td className="py-2 pr-3 font-inter text-[var(--text-1)]">{row.availabilityPct != null ? `${row.availabilityPct.toFixed(1)}%` : '—'}</td>
                         <td className="py-2 font-inter text-[#06B6D4]">{typeof row.avgAcc === 'number' ? `${row.avgAcc} m` : '—'}</td>
                       </tr>
                     ))}

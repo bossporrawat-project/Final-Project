@@ -10,6 +10,7 @@ interface MapComponentProps {
   liveData?: any[];
   historyData?: any[];
   clearSignal?: number;
+  kmlRoute?: { lat: number; lng: number }[];
 }
 
 function isValidPos(pos: any): boolean {
@@ -72,13 +73,14 @@ function buildArrowSvg(bearing: number | null, size: number = 11) {
   `;
 }
 
-export default function MapComponent({ theme, liveData = [], historyData = [], clearSignal = 0 }: MapComponentProps) {
+export default function MapComponent({ theme, liveData = [], historyData = [], clearSignal = 0, kmlRoute }: MapComponentProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
   const tileLayerRef = useRef<L.TileLayer | null>(null);
   const markersGroupRef = useRef<L.LayerGroup | null>(null);
   const linesGroupRef = useRef<L.LayerGroup | null>(null);
   const dotsGroupRef = useRef<L.LayerGroup | null>(null);
+  const kmlGroupRef = useRef<L.LayerGroup | null>(null);
 
   // Persistent layer registries so open popups are never destroyed on live data updates
   // and old points are NEVER deleted until Clear is clicked
@@ -134,6 +136,7 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
     linesGroupRef.current = L.layerGroup().addTo(map);
     dotsGroupRef.current = L.layerGroup().addTo(map);
     markersGroupRef.current = L.layerGroup().addTo(map);
+    kmlGroupRef.current = L.layerGroup().addTo(map);
     mapRef.current = map;
 
     const timer = setTimeout(() => {
@@ -158,6 +161,7 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
       linesGroupRef.current = null;
       dotsGroupRef.current = null;
       markersGroupRef.current = null;
+      kmlGroupRef.current = null;
       try {
         map.remove();
       } catch {}
@@ -194,6 +198,36 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
     dotsGroupRef.current?.clearLayers();
     markersGroupRef.current?.clearLayers();
   }, [clearSignal]);
+
+  // Draw KML Ground-Truth reference route whenever uploaded/cleared
+  useEffect(() => {
+    const map = mapRef.current;
+    const kmlGroup = kmlGroupRef.current;
+    if (!map || !kmlGroup) return;
+    kmlGroup.clearLayers();
+    if (!kmlRoute || kmlRoute.length === 0) return;
+
+    const latlngs: [number, number][] = kmlRoute.map((p) => [p.lat, p.lng]);
+    if (latlngs.length >= 2) {
+      L.polyline(latlngs, {
+        color: '#FACC15',
+        weight: 4,
+        opacity: 0.9,
+        dashArray: '8 6',
+      })
+        .bindTooltip('KML (Manual Route / Ground Truth)', { sticky: true })
+        .addTo(kmlGroup);
+    } else {
+      L.circleMarker(latlngs[0], { radius: 7, color: '#FACC15', fillOpacity: 0.9 })
+        .bindTooltip('KML Reference Point')
+        .addTo(kmlGroup);
+    }
+
+    const kmlBounds = L.latLngBounds(latlngs);
+    if (kmlBounds.isValid()) {
+      map.fitBounds(kmlBounds, { padding: [55, 55], maxZoom: 17 });
+    }
+  }, [kmlRoute]);
 
   const hasFittedBounds = useRef(false);
 

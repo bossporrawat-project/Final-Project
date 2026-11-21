@@ -12,7 +12,7 @@
 | **Edge Connectivity & Stealth Web** | `ESP32 WebServer` (`PROGMEM` HTML5/JS Vault @ `/boss-sd`), `WIFI_AP_STA` (`Multi-WiFi 2.4GHz` + Offline AP `BOSS_SD_VAULT`), `HTTPClient` Keep-Alive | อ่าน/ดาวน์โหลดไฟล์ทั้งหมดบน SD Card ผ่านเบราว์เซอร์แบบออฟไลน์ (หน้า `/` ตอบ `404`) และส่ง Batch ขึ้น Cloud |
 | **Mobile & Other Sources** | Android Native (`Kotlin`, SDK `26–34`, `FusedLocationProviderClient`, `OkHttp 4.12.0`), HTML5 Geolocation API, `Traccar` (`REST / WebSocket / Webhook`) | แหล่งส่งพิกัดเปรียบเทียบความแม่นยำร่วมกับ IoT ESP32 |
 | **Web Frontend** | `Next.js 16.4.3` (App Router), `React 19.3.0`, `TypeScript 5`, Tailwind CSS, `lucide-react 1.54.0` | หน้าเว็บแดชบอร์ดแสดงแผนที่ ตารางเปรียบเทียบ และแผงวิเคราะห์ |
-| **Map & Data Visualization** | `Leaflet 1.9.4`, `react-leaflet 5.0.0`, `Recharts 3.10.1` | วาดเส้นทางบนแผนที่แบบ Decimation, ลูกศรทิศทาง, และ Radar Chart เปรียบเทียบความแม่นยำ |
+| **Map & Data Visualization** | `Leaflet 1.9.4`, `react-leaflet 5.0.0`, `Recharts 3.10.1`, KML XML Parser (`DOMParser`) | วาดเส้นทางบนแผนที่แบบ Decimation, ซ้อนเส้นทางอ้างอิง `.kml`, ลูกศรทิศทาง, Radar Chart และตาราง Telemetry Benchmark |
 | **Hot Database & Compute** | `Supabase` (`@supabase/supabase-js 2.117.3`), `PostgreSQL` (`B-Tree + BRIN Index`, `PL/pgSQL Trigger`, `SQL RPCs`), `Supabase Realtime` (`postgres_changes`) | เก็บสถานะล่าสุด + ประวัติ Time-Series, ประมวลผล Analysis ระดับล้านแถวบน Server, และส่ง Real-time Stream |
 | **Cold Archive Storage** | `Cloudflare R2` (S3-compatible API via `@aws-sdk/client-s3 3.1169.0`), `zlib` Gzip Level-9 NDJSON (`archives/YYYY-MM-DD/*.jsonl.gz`) | เก็บประวัติเก่าเกิน Retention Window ระยะยาวแบบบีบอัด แยกตามวันที่กรุงเทพฯ |
 | **DevOps & Lifecycle Cron** | `Vercel` (Next.js Hosting + API Routes), `GitHub Actions` (`ci.yml` + `archive-r2.yml` Cron ทุก 6 ชม. บน Node `20`) | Build/Deploy อัตโนมัติ และย้ายข้อมูลเก่าจาก Supabase ไป Cloudflare R2 ตามตารางเวลา |
@@ -65,11 +65,19 @@
   4. เมื่อ R2 ตอบกลับสำเร็จ (`< 300`) จึงลบแถวต้นทางออกจาก Supabase ทีละ `200 ID`
 
 ### Layer 6: Presentation & Analytics Layer (Next.js Dashboard UI)
-* **Map Visualization (`Web/src/components/MapComponent.tsx`):** แผนที่ Leaflet, เส้นทางที่ Decimate แล้ว, ลูกศรทิศทาง, และการซ้อนแสดงผลข้อมูลที่โหลดกลับมาจาก Cloudflare R2
+* **Map Visualization (`Web/src/components/MapComponent.tsx`):** แผนที่ Leaflet, เส้นทางที่ Decimate แล้ว, ลูกศรทิศทาง, การซ้อนแสดงผลข้อมูลที่โหลดกลับมาจาก Cloudflare R2 และซ้อนเส้นทางอ้างอิง `.kml` แบบเส้นประ (`Ground Truth`)
 * **Comparison & History (`Web/src/components/DataTables.tsx`, `CloudArchiveBar.tsx`):**
   * **Live Tracking Comparison:** เลือกเปรียบเทียบ Device ข้ามกลุ่มได้ พร้อมแถบสถานะ `LIVE Xs`
   * **History Log:** แบ่งหน้าแบบ Server-Side Pagination (`.range()`), แสดง `Date` + `Time`, และแถบ **Cloud Archive Bar** สำหรับโหลด/ดาวน์โหลด CSV จาก R2 ตามวัน
-* **Accuracy Analytics (`Web/src/components/AnalysisPanel.tsx`):** วิเคราะห์ความแม่นยำ 4 โหมดอ้างอิง, ตารางจัดอันดับ Device, และ `RadarChart` (Recharts)
+* **Accuracy & Telemetry Benchmark (`Web/src/components/AnalysisPanel.tsx`, `Web/src/utils/calculations.ts`):**
+  * วิเคราะห์ความแม่นยำ **5 โหมดอ้างอิง**: `Auto Centroid`, `เทียบ Device หลัก`, `Live GPS`, `กำหนดเอง`, และ **`KML Main Route`** (รองรับอัปโหลดไฟล์ `.kml` ทั้ง `LineString`, `gx:Track`, `Point` คำนวณ Cross-Track Segment Error บนเส้นทางจริง)
+  * **Route & Telemetry Benchmark Matrix (5 Metrics):** เปรียบเทียบทุกแหล่ง (`IoT Data`, `API / Traccar`, `Native`, `Browser`, `KML Manual Route`) ใน 5 มิติ:
+    1. `Accuracy (Avg Error on Main Route)` (`m`)
+    2. `Update Interval` (`s`)
+    3. `Average Speed` (`m/s`)
+    4. `Data Consistency` (`%`)
+    5. `Availability / Uptime` (`%`)
+  * ตาราง `Device Accuracy Ranking` (แสดงครบทั้ง Error, Interval, Speed, Consistency, Uptime) และ `RadarChart` (Recharts)
 
 ---
 
@@ -129,7 +137,9 @@ flowchart TB
     end
 
     subgraph L6["6. Presentation & Analytics (Next.js 16 + React 19)"]
-        UI["OmniTrack Web Dashboard\nLeaflet Map | Live Comparison\nAnalysis Radar | R2 Archive Bar"]
+        UI["OmniTrack Web Dashboard\nLeaflet Map (+ KML Ground Truth) | Live Comparison\n5-Metric Benchmark & Radar | R2 Archive Bar"]
+        KML["KML Upload (.kml)\nCross-Track Route Analysis"]
+        KML -->|"DOMParser + Segment Error"| UI
         RT -->|"WebSocket + 2.5s Poll"| UI
         RPC --> UI
         APIA --> UI
