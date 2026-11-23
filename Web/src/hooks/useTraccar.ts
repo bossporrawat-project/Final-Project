@@ -18,6 +18,7 @@ export function useTraccar(initialToken?: string | null) {
   
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const pollIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const connect = useCallback(async (traccarToken: string, serverHost: string = 'demo3.traccar.org') => {
     if (wsRef.current) {
@@ -27,6 +28,10 @@ export function useTraccar(initialToken?: string | null) {
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
       reconnectTimeoutRef.current = null;
+    }
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
     }
 
     const cleanToken = traccarToken.trim();
@@ -65,6 +70,7 @@ export function useTraccar(initialToken?: string | null) {
         if (posRes.ok) {
           resolvedHost = host;
           authorized = true;
+          setIsConnected(true);
           const initialPositions = await posRes.json();
           if (Array.isArray(initialPositions) && initialPositions.length > 0) {
             setPositions(initialPositions);
@@ -84,6 +90,28 @@ export function useTraccar(initialToken?: string | null) {
     }
 
     const cleanHost = resolvedHost;
+
+    // 1.5 Continuous REST polling every 3s (guarantees live updates even when cross-domain WebSocket cookies are blocked)
+    pollIntervalRef.current = setInterval(async () => {
+      try {
+        const res = await fetch(`https://${cleanHost}/api/positions`, {
+          headers: {
+            'Authorization': `Bearer ${cleanToken}`,
+            'Accept': 'application/json'
+          }
+        });
+        if (res.ok) {
+          setIsConnected(true);
+          setError(null);
+          const latest = await res.json();
+          if (Array.isArray(latest) && latest.length > 0) {
+            setPositions(latest);
+          }
+        }
+      } catch {
+        // Ignore transient network errors during poll
+      }
+    }, 3000);
 
     // 2. Connect WebSocket for real-time stream
     try {
@@ -106,7 +134,7 @@ export function useTraccar(initialToken?: string | null) {
       };
       
       ws.onclose = (ev) => {
-        setIsConnected(false);
+        if (!pollIntervalRef.current) setIsConnected(false);
         // Do not infinitely retry if unauthorized / policy violation
         if (ev.code === 1008 || ev.code === 1003) return;
         reconnectTimeoutRef.current = setTimeout(() => {
@@ -115,8 +143,7 @@ export function useTraccar(initialToken?: string | null) {
       };
       
       ws.onerror = () => {
-        setIsConnected(false);
-        setError('ไม่สามารถเชื่อมต่อ Traccar WebSocket ได้ (ตรวจสอบ Token หรือ Server)');
+        // REST polling still keeps Traccar connected if Bearer token is valid
       };
       
       wsRef.current = ws;
@@ -136,6 +163,10 @@ export function useTraccar(initialToken?: string | null) {
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
       reconnectTimeoutRef.current = null;
+    }
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
     }
     setIsConnected(false);
   }, []);

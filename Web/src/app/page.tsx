@@ -95,7 +95,7 @@ export default function Dashboard() {
   const [analysisTick, setAnalysisTick] = useState(0);
   const [kmlRoute, setKmlRoute] = useState<ParsedKmlRoute | null>(null);
   const lastHistoryRecordRef = useRef<{ lat: number; lng: number; time: number } | null>(null);
-  const lastTraccarRecordRef = useRef<Record<string, { lat: number; lng: number; time: number }>>({});
+  const lastTraccarRecordRef = useRef<Record<string, { lat: number; lng: number; time: number; devTime?: string }>>({});
   const lastIoTRecordRef = useRef<Record<string, { lat: number; lng: number; timeStr: string; time: number }>>({});
   const livePollRef = useRef<NodeJS.Timeout | null>(null);
 
@@ -366,7 +366,20 @@ export default function Dashboard() {
           appendHistoryPoint({
             ...r,
             id: `${r.device_id}_${r.device_time || r.updated_at}_${r.latitude}_${r.longitude}`
-          });
+          }, true);
+          // Ensure Native app live updates are also persisted to gps_history if the mobile batch insert hit a duplicate timestamp conflict
+          if (r.source === 'native' && r.device_time) {
+            client.from('gps_history').upsert({
+              device_id: r.device_id,
+              latitude: r.latitude,
+              longitude: r.longitude,
+              speed: r.speed || 0,
+              accuracy: r.accuracy ?? null,
+              source: 'native',
+              device_time: r.device_time,
+              server_time: r.server_time || r.updated_at || new Date().toISOString()
+            }, { onConflict: 'device_id,device_time' }).then();
+          }
         }
       };
 
@@ -463,8 +476,8 @@ export default function Dashboard() {
           const dist = last ? haversine(last.lat, last.lng, tp.latitude, tp.longitude) : 999;
           const elapsed = last ? (Date.now() - last.time) : 999999;
 
-          if (!last || dist > 3 || elapsed > 30000) {
-            lastTraccarRecordRef.current[devId] = { lat: tp.latitude, lng: tp.longitude, time: Date.now() };
+          if (!last || last.devTime !== devTime || dist > 1 || elapsed > 10000) {
+            lastTraccarRecordRef.current[devId] = { lat: tp.latitude, lng: tp.longitude, time: Date.now(), devTime };
             appendHistoryPoint({
               id: `local_${devId}_${devTime}`,
               device_id: devId,

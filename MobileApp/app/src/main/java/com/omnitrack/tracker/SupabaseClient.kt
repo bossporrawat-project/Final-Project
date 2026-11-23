@@ -31,7 +31,7 @@ class SupabaseClient(private val context: android.content.Context) {
     }
 
     fun sendAppStatus(deviceId: String, appStatus: String) {
-        val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.getDefault())
+        val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
         isoFormat.timeZone = TimeZone.getTimeZone("UTC")
         val now = isoFormat.format(Date())
 
@@ -43,6 +43,8 @@ class SupabaseClient(private val context: android.content.Context) {
         json.put("app_status", appStatus)
         json.put("source", "native")
         json.put("is_online", true)
+        json.put("device_time", now)
+        json.put("server_time", now)
         json.put("updated_at", now)
 
         val body = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
@@ -74,13 +76,14 @@ class SupabaseClient(private val context: android.content.Context) {
     fun batchUpsertPosition(deviceId: String, locations: List<android.location.Location>) {
         if (locations.isEmpty()) return
         
-        val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.getDefault())
+        val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US)
         isoFormat.timeZone = TimeZone.getTimeZone("UTC")
         val now = isoFormat.format(Date())
         
         // 1. Update the latest position in gps_positions
         val latest = locations.last()
         val latestSpeed = (latest.speed * 3.6).toFloat()
+        val latestLocTime = isoFormat.format(Date(latest.time))
         
         val json = JSONObject()
         json.put("device_id", deviceId)
@@ -92,6 +95,8 @@ class SupabaseClient(private val context: android.content.Context) {
         json.put("app_status", "Tracking Active")
         json.put("source", "native")
         json.put("is_online", true)
+        json.put("device_time", latestLocTime)
+        json.put("server_time", now)
         json.put("updated_at", now)
 
         val body = json.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
@@ -119,9 +124,16 @@ class SupabaseClient(private val context: android.content.Context) {
             }
         })
         
-        // 2. Batch insert into gps_history
+        // 2. Batch upsert into gps_history (deduplicated by device_time so duplicate timestamps in the same batch never trigger HTTP 409)
         val historyArray = org.json.JSONArray()
-        for (loc in locations) {
+        val seenTimes = mutableSetOf<String>()
+        for ((idx, loc) in locations.withIndex()) {
+            var locTime = isoFormat.format(Date(loc.time))
+            if (seenTimes.contains(locTime)) {
+                locTime = isoFormat.format(Date(loc.time + idx + 1))
+            }
+            seenTimes.add(locTime)
+
             val h = JSONObject()
             h.put("device_id", deviceId)
             h.put("latitude", loc.latitude)
@@ -129,19 +141,18 @@ class SupabaseClient(private val context: android.content.Context) {
             h.put("speed", (loc.speed * 3.6).toFloat())
             h.put("accuracy", loc.accuracy)
             h.put("source", "native")
-            
-            // Generate timestamp for each location (approximated based on time collected)
-            val locTime = isoFormat.format(Date(loc.time))
-            h.put("recorded_at", locTime)
+            h.put("device_time", locTime)
+            h.put("server_time", now)
             historyArray.put(h)
         }
 
         val historyBody = historyArray.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
         val historyRequest = Request.Builder()
-            .url("$supabaseUrl/rest/v1/gps_history")
+            .url("$supabaseUrl/rest/v1/gps_history?on_conflict=device_id,device_time")
             .addHeader("apikey", supabaseKey)
             .addHeader("Authorization", "Bearer $supabaseKey")
             .addHeader("Content-Type", "application/json")
+            .addHeader("Prefer", "resolution=merge-duplicates,return=minimal")
             .post(historyBody)
             .build()
 
