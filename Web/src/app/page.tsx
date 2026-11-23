@@ -116,18 +116,29 @@ export default function Dashboard() {
   const [serverCentroid, setServerCentroid] = useState<{ total: number; lat: number; lng: number } | null>(null);
   const [serverDeviceRows, setServerDeviceRows] = useState<DeviceAnalysisRow[] | null>(null);
   const histKeySetRef = useRef<Set<string>>(new Set());
+  const historyPageRef = useRef<number>(1);
+  const filterRef = useRef(filter);
 
-  const makeHistKey = (pt: Position) => {
+  useEffect(() => {
+    historyPageRef.current = historyPage;
+  }, [historyPage]);
+
+  useEffect(() => {
+    filterRef.current = filter;
+  }, [filter]);
+
+  const makeCoordKey = (pt: Position) => {
     const ptTime = pt.device_time || pt.recorded_at || pt.updated_at || '';
-    return pt.id
-      ? String(pt.id)
-      : `${pt.device_id}_${ptTime}_${Number(pt.latitude).toFixed(6)}_${Number(pt.longitude).toFixed(6)}`;
+    return `${pt.device_id}_${ptTime}_${Number(pt.latitude).toFixed(6)}_${Number(pt.longitude).toFixed(6)}`;
   };
 
-  const appendHistoryPoint = useCallback((pt: Position, countAsNewDbInsert: boolean = false) => {
+  const makeHistKey = (pt: Position) => {
+    return pt.id ? String(pt.id) : makeCoordKey(pt);
+  };
+
+  const appendHistoryPoint = useCallback((pt: Position, countAsNewDbInsert: boolean = true) => {
     if (!pt || !pt.device_id || pt.source === 'browser' || (pt.latitude === 0 && pt.longitude === 0)) return;
-    const ptTime = pt.device_time || pt.recorded_at || pt.updated_at || '';
-    const coordKey = `${pt.device_id}_${ptTime}_${Number(pt.latitude).toFixed(6)}_${Number(pt.longitude).toFixed(6)}`;
+    const coordKey = makeCoordKey(pt);
     const idKey = pt.id ? String(pt.id) : coordKey;
     if (histKeySetRef.current.has(idKey) || histKeySetRef.current.has(coordKey)) return;
 
@@ -143,8 +154,16 @@ export default function Dashboard() {
     });
 
     if (countAsNewDbInsert) {
-      setTotalHistoryCount(c => c + 1);
-      setHistoryPageRows(prev => [pt, ...prev].slice(0, HISTORY_PAGE_SIZE));
+      const curFilter = filterRef.current;
+      const matchesFilter =
+        (curFilter.src === 'all' || pt.source === curFilter.src) &&
+        (curFilter.dev === 'all' || pt.device_id === curFilter.dev);
+      if (matchesFilter) {
+        setTotalHistoryCount(c => c + 1);
+        if (historyPageRef.current === 1) {
+          setHistoryPageRows(prev => [pt, ...prev].slice(0, HISTORY_PAGE_SIZE));
+        }
+      }
     }
   }, [setHistArr]);
 
@@ -172,9 +191,15 @@ export default function Dashboard() {
         .range(from, to);
 
       if (!error) {
+        const rows = (data || []) as Position[];
+        rows.forEach((row) => {
+          histKeySetRef.current.add(makeHistKey(row));
+          histKeySetRef.current.add(makeCoordKey(row));
+        });
         if (typeof count === 'number') setTotalHistoryCount(count);
-        setHistoryPageRows(data || []);
+        setHistoryPageRows(rows);
         setHistoryPage(safePage);
+        historyPageRef.current = safePage;
       }
     } finally {
       setIsHistoryLoading(false);
@@ -217,6 +242,7 @@ export default function Dashboard() {
       const client = getSupabaseClient(url, key);
       setSupabase(client);
       setSupaStatus(true);
+      histKeySetRef.current.clear();
       // Fetch initial live positions ordered by actual server arrival time
       const { data: rawLiveData } = await client
         .from('gps_positions')
@@ -310,13 +336,9 @@ export default function Dashboard() {
         return tb - ta;
       });
 
-      histKeySetRef.current.clear();
       historyData.forEach((row) => {
         histKeySetRef.current.add(makeHistKey(row));
-        const ptTime = row.device_time || row.recorded_at || row.updated_at || '';
-        histKeySetRef.current.add(
-          `${row.device_id}_${ptTime}_${Number(row.latitude).toFixed(6)}_${Number(row.longitude).toFixed(6)}`
-        );
+        histKeySetRef.current.add(makeCoordKey(row));
       });
       
       const lastSeenSigByDev: Record<string, string> = {};
@@ -325,6 +347,7 @@ export default function Dashboard() {
         liveData.forEach((r: any) => {
           liveMap[r.device_id] = r;
           lastSeenSigByDev[r.device_id] = `${r.updated_at || ''}|${r.device_time || ''}|${r.latitude}|${r.longitude}|${r.speed}`;
+          histKeySetRef.current.add(makeCoordKey(r));
         });
         setLivePos(liveMap);
       }
@@ -365,20 +388,35 @@ export default function Dashboard() {
           appendHistoryPoint(payload.new, true);
         }).subscribe();
 
-      // Resilient polling fallback so Live Tracking Comparison stays real-time even if WebSocket stalls
+      // Resilient polling fallback so both Live Tracking Comparison and History Log stay real-time even if WebSocket stalls
       livePollRef.current = setInterval(async () => {
         try {
-          const { data: latestRows, error } = await client
-            .from('gps_positions')
-            .select('*')
-            .order('updated_at', { ascending: false, nullsFirst: false });
-          if (!error && Array.isArray(latestRows)) {
-            latestRows.forEach(applyIncomingLiveRow);
+          const [posRes, histRes] = await Promise.all([
+            client
+              .from('gps_positions')
+              .select('*')
+              .neq('source', 'browser')
+              .order('updated_at', { ascending: false, nullsFirst: false }),
+            client
+              .from('gps_history')
+              .select('*')
+              .neq('source', 'browser')
+              .order('server_time', { ascending: false, nullsFirst: false })
+              .limit(25)
+          ]);
+          if (!posRes.error && Array.isArray(posRes.data)) {
+            posRes.data.forEach(applyIncomingLiveRow);
+          }
+          if (!histRes.error && Array.isArray(histRes.data) && histRes.data.length > 0) {
+            // Feed oldest-to-newest so the newest row ends up on top of History Log
+            for (let i = histRes.data.length - 1; i >= 0; i--) {
+              appendHistoryPoint(histRes.data[i], true);
+            }
           }
         } catch {
           // Ignore transient network hiccups during background polling
         }
-      }, 2500);
+      }, 2000);
         
     } catch (err) {
       console.error(err);
