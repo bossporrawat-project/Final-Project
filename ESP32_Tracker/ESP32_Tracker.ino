@@ -4,7 +4,7 @@
  * ============================================================================
  * GPS Module + SD Card + Supabase (ไม่มี Firebase แล้ว):
  * 1. GPS (UART1: RX=16, TX=17, Baud 9600 -> 115200 อัตโนมัติ) + คำสั่ง UBX ตั้งค่า 5Hz
- * 2. MH-SD Card Module (VSPI: CS=5, SCK=18, MISO=19, MOSI=23)
+ * 2. MH-SD Card Module (SPI: CS=25, SCK=26, MISO=27, MOSI=33) + LittleFS Auto-Fallback
  *    - บันทึก CSV แยกไฟล์ตามวัน (/gps_YYYY-MM-DD.csv) เวลาไทย (UTC+7)
  *    - ระบบ Offline Queue (/offline_queue.jsonl): หาก Wi-Fi หลุดหรืออยู่ข้างนอก
  *      จะเก็บคิวลง SD Card และทยอยซิงก์เข้า Supabase ให้อัตโนมัติเมื่อต่อ Wi-Fi ได้
@@ -71,11 +71,11 @@ const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXB
 #define GPS_INIT_BAUD 9600
 #define GPS_WORK_BAUD 115200
 
-// SD Card Module (VSPI มาตรฐานตามรูปที่คุณบอสต่อ)
-#define SD_CS_PIN   5
-#define SD_SCK_PIN  18
-#define SD_MISO_PIN 19
-#define SD_MOSI_PIN 23
+// SD Card Module (ย้ายมาชุดขาฝั่งเดียวกัน: CS=25, SCK=26, MISO=27, MOSI=33)
+#define SD_CS_PIN   25
+#define SD_SCK_PIN  26
+#define SD_MISO_PIN 27
+#define SD_MOSI_PIN 33
 
 // ==================== 4. ความถี่การส่งข้อมูล (โหมด 5Hz สำหรับรถ EV) ====================
 const unsigned long LOG_INTERVAL_MS   = 200;   // 200 ms = 5 Hz (5 จุด/วินาที ลง SD Card + Buffer)
@@ -452,7 +452,7 @@ bool recoverSDCard() {
   if (littleFsReady) {
     Serial.println("💾 [Auto-Fallback] ยังไม่พบ SD Card -> บันทึกลง Internal Flash (LittleFS) ในบอร์ดต่อเนื่อง");
   } else {
-    Serial.println("⚠️ [SD Card] ยังกู้คืนไม่สำเร็จ (เช็กไฟ 5V VIN / ขา 5,18,19,23)");
+    Serial.println("⚠️ [SD Card] ยังกู้คืนไม่สำเร็จ (เช็กไฟ 5V VIN / ขา CS=25, SCK=26, MISO=27, MOSI=33)");
   }
   return false;
 }
@@ -487,7 +487,7 @@ void initSDCard() {
   // 2. ลองเชื่อมต่อโมดูล SD Card ภายนอก
   lastSdRecoverTime = millis();
   if (!mountSdOnce()) {
-    Serial.println("⚠️ [SD Card] ไม่พบโมดูล SD Card หรือการ์ดยังไม่ได้เสียบ (VCC->VIN 5V | CS->5 | SCK->18 | MISO->19 | MOSI->23)");
+    Serial.println("⚠️ [SD Card] ไม่พบโมดูล SD Card หรือการ์ดยังไม่ได้เสียบ (VCC->VIN 5V | CS->25 | SCK->26 | MISO->27 | MOSI->33)");
     if (littleFsReady) {
       Serial.println("✅ [Auto-Fallback] สลับมาบันทึกลง Internal Flash (LittleFS) ในตัวบอร์ดอัตโนมัติ (เข้าดูผ่าน /boss-sd ได้ทันที)");
     }
