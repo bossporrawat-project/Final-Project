@@ -74,6 +74,25 @@ export function useTraccar(initialToken?: string | null) {
           const initialPositions = await posRes.json();
           if (Array.isArray(initialPositions) && initialPositions.length > 0) {
             setPositions(initialPositions);
+            // Also fetch recent route history (last 6h) for each active device so full Traccar tracks sync to Supabase & Map
+            const toIso = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+            const fromIso = new Date(Date.now() - 6 * 3600 * 1000).toISOString();
+            for (const p of initialPositions) {
+              if (!p?.deviceId) continue;
+              fetch(`https://${host}/api/positions?deviceId=${p.deviceId}&from=${encodeURIComponent(fromIso)}&to=${encodeURIComponent(toIso)}`, {
+                headers: {
+                  'Authorization': `Bearer ${cleanToken}`,
+                  'Accept': 'application/json'
+                }
+              })
+                .then((r) => (r.ok ? r.json() : null))
+                .then((histPts) => {
+                  if (Array.isArray(histPts) && histPts.length > 1) {
+                    setPositions(histPts);
+                  }
+                })
+                .catch(() => {});
+            }
           }
           break;
         }

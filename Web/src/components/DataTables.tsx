@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Locate, Activity, Cpu } from 'lucide-react';
+import { Locate, Activity, Cpu, Download, Columns, Table } from 'lucide-react';
 import CloudArchiveBar from '@/components/CloudArchiveBar';
 
 export interface PositionData {
@@ -30,6 +30,21 @@ interface DataTablesProps {
   onHistoryPageChange?: (page: number) => void;
   isHistoryLoading?: boolean;
   onLoadArchivedPoints?: (rows: any[], date: string) => void;
+  sourceHistoryRows?: {
+    native: PositionData[];
+    traccar: PositionData[];
+    iot: PositionData[];
+  };
+  sourceCounts?: {
+    all: number;
+    native: number;
+    traccar: number;
+    iot: number;
+  };
+  currentSrcFilter?: string;
+  onSourceTabChange?: (src: string) => void;
+  onExportSource?: (src: string) => void;
+  exportProgress?: string | null;
 }
 
 function getTimestampMs(raw?: string): number {
@@ -67,9 +82,16 @@ export default function DataTables({
   onHistoryPageChange,
   isHistoryLoading = false,
   onLoadArchivedPoints,
+  sourceHistoryRows,
+  sourceCounts,
+  currentSrcFilter = 'all',
+  onSourceTabChange,
+  onExportSource,
+  exportProgress,
 }: DataTablesProps) {
   const [nowMs, setNowMs] = useState<number>(0);
   const [selectedBySlot, setSelectedBySlot] = useState<Record<string, string>>({});
+  const [splitByDeviceMode, setSplitByDeviceMode] = useState<boolean>(true);
 
   useEffect(() => {
     setNowMs(Date.now());
@@ -286,11 +308,39 @@ export default function DataTables({
 
       <div className="mt-8">
         <CloudArchiveBar onLoadArchivedPoints={onLoadArchivedPoints} />
-        <div className="dsec-header flex flex-wrap justify-between items-center gap-2 mb-4">
-          <span>
-            History Log ({(totalHistoryCount ?? historyData.length).toLocaleString()} records in DB)
-          </span>
-          {onHistoryPageChange && (totalHistoryCount ?? historyData.length) > historyPageSize && (
+        <div className="dsec-header flex flex-wrap justify-between items-center gap-2 mb-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span>
+              History Log ({(totalHistoryCount ?? historyData.length).toLocaleString()} records in DB)
+            </span>
+            <button
+              type="button"
+              onClick={() => setSplitByDeviceMode((v) => !v)}
+              className={`inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1 rounded-full border transition-colors ${
+                splitByDeviceMode
+                  ? 'bg-[#06B6D4]/15 text-[#06B6D4] border-[#06B6D4]/50'
+                  : 'bg-[var(--bg-secondary)] text-[var(--text-2)] border-[var(--border)] hover:bg-[var(--bg-card-hover)]'
+              }`}
+              title="สลับระหว่างแสดงแยก 3 ตารางตามอุปกรณ์ กับตารางรวม"
+            >
+              {splitByDeviceMode ? <Columns size={13} /> : <Table size={13} />}
+              {splitByDeviceMode ? 'โหมด: แยก 3 ตารางตามอุปกรณ์' : 'โหมด: ตารางรวม'}
+            </button>
+            {onExportSource && (
+              <button
+                type="button"
+                disabled={!!exportProgress}
+                onClick={() => onExportSource(currentSrcFilter)}
+                className="inline-flex items-center gap-1.5 text-xs font-semibold px-3 py-1 rounded-full border border-emerald-500/40 bg-emerald-500/10 text-emerald-400 hover:bg-emerald-500/20 disabled:opacity-50 transition-colors"
+                title="ดาวน์โหลดข้อมูลทั้งหมดในฐานข้อมูลเป็นไฟล์ CSV"
+              >
+                <Download size={13} />
+                {exportProgress || (currentSrcFilter === 'all' ? 'Export ทั้งหมด (ครบทุกแถว)' : `Export เฉพาะ ${currentSrcFilter.toUpperCase()}`)}
+              </button>
+            )}
+          </div>
+
+          {!splitByDeviceMode && onHistoryPageChange && (totalHistoryCount ?? historyData.length) > historyPageSize && (
             <div className="flex items-center gap-2 text-xs font-normal">
               <button
                 type="button"
@@ -314,59 +364,221 @@ export default function DataTables({
             </div>
           )}
         </div>
-        <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-[var(--r)] overflow-hidden shadow-[var(--shadow)]">
-          <div className="max-h-[340px] overflow-y-auto">
-            <table className="w-full text-sm">
-              <thead className="sticky top-0 bg-[var(--bg-primary)] z-10 text-left border-b border-[var(--border)]">
-                <tr>
-                  <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Source</th>
-                  <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Device</th>
-                  <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Lat / Lng</th>
-                  <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Speed</th>
-                  <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Accuracy</th>
-                  <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Date</th>
-                  <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Time</th>
-                </tr>
-              </thead>
-              <tbody>
-                {isHistoryLoading ? (
-                  <tr>
-                    <td colSpan={7} className="p-8 text-center text-[var(--text-3)]">กำลังโหลดข้อมูลหน้า {historyPage}...</td>
-                  </tr>
-                ) : historyData.length === 0 ? (
-                  <tr>
-                    <td colSpan={7} className="p-8 text-center text-[var(--text-3)]">No history records yet.</td>
-                  </tr>
-                ) : (
-                  historyData.slice(0, historyPageSize).map((row) => {
-                    const rawTime = row.device_time || row.timestamp || row.recorded_at || row.updated_at || '';
-                    return (
-                      <tr key={row.id} className="border-b border-[var(--row-alt)] hover:bg-[var(--bg-card-hover)] transition-colors">
-                        <td className="p-3">
-                          <span className={`text-[10px] px-2 py-1 rounded-full border uppercase font-bold
-                            ${row.source === 'browser' ? 'bg-[#06B6D4]/10 text-[#06B6D4] border-[#06B6D4]/30' : 
-                              row.source === 'traccar' ? 'bg-[#8B5CF6]/10 text-[#8B5CF6] border-[#8B5CF6]/30' : 
-                              row.source === 'iot' ? 'bg-[#F97316]/10 text-[#F97316] border-[#F97316]/30' : 
-                              row.source === 'native' ? 'bg-[#10B981]/10 text-[#10B981] border-[#10B981]/30' :
-                              'bg-gray-500/10 text-gray-400 border-gray-500/30'}`}
-                          >
-                            {row.source}
-                          </span>
-                        </td>
-                        <td className="p-3">{row.device_id}</td>
-                        <td className="p-3 font-inter">{row.latitude.toFixed(5)}, {row.longitude.toFixed(5)}</td>
-                        <td className="p-3 text-[#F59E0B] font-inter">{(row.speed || 0).toFixed(1)}</td>
-                        <td className="p-3 text-[#06B6D4] font-inter">{row.accuracy ? `${row.accuracy.toFixed(1)}m` : '—'}</td>
-                        <td className="p-3 text-[var(--text-2)] font-inter">{formatDateTH(rawTime)}</td>
-                        <td className="p-3 text-[var(--text-3)] font-inter">{formatTimeTH(rawTime)}</td>
-                      </tr>
-                    );
-                  })
-                )}
-              </tbody>
-            </table>
-          </div>
+
+        {/* Source filter tabs with live database row counts */}
+        <div className="flex flex-wrap items-center gap-2 mb-4">
+          {[
+            { key: 'all', label: 'ทั้งหมด (All)', count: sourceCounts?.all ?? totalHistoryCount ?? historyData.length, color: '#06B6D4' },
+            { key: 'native', label: 'Native (Android)', count: sourceCounts?.native ?? 0, color: '#10B981' },
+            { key: 'traccar', label: 'Traccar', count: sourceCounts?.traccar ?? 0, color: '#8B5CF6' },
+            { key: 'iot', label: 'IoT ESP32', count: sourceCounts?.iot ?? 0, color: '#F97316' },
+          ].map((tab) => {
+            const isActive = !splitByDeviceMode && currentSrcFilter === tab.key;
+            return (
+              <button
+                key={tab.key}
+                type="button"
+                onClick={() => {
+                  if (tab.key === 'all') {
+                    onSourceTabChange?.('all');
+                  } else {
+                    setSplitByDeviceMode(false);
+                    onSourceTabChange?.(tab.key);
+                  }
+                }}
+                className={`inline-flex items-center gap-2 text-xs px-3 py-1.5 rounded-lg border transition-all ${
+                  isActive
+                    ? 'font-bold shadow-sm'
+                    : 'bg-[var(--bg-card)] text-[var(--text-2)] border-[var(--border)] hover:bg-[var(--bg-card-hover)]'
+                }`}
+                style={
+                  isActive
+                    ? { borderColor: tab.color, backgroundColor: `${tab.color}1A`, color: tab.color }
+                    : undefined
+                }
+              >
+                <span>{tab.label}</span>
+                <span
+                  className="px-1.5 py-0.5 rounded text-[11px] font-inter font-bold"
+                  style={{ backgroundColor: `${tab.color}22`, color: tab.color }}
+                >
+                  {tab.count.toLocaleString()}
+                </span>
+              </button>
+            );
+          })}
         </div>
+
+        {splitByDeviceMode ? (
+          <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+            {[
+              {
+                key: 'native',
+                title: 'Native (Android)',
+                color: '#10B981',
+                headerClass: 'ch-native',
+                rows: sourceHistoryRows?.native ?? historyData.filter((r) => r.source === 'native'),
+                count: sourceCounts?.native ?? 0,
+              },
+              {
+                key: 'traccar',
+                title: 'Traccar (Deep Analytics)',
+                color: '#8B5CF6',
+                headerClass: 'ch-traccar',
+                rows: sourceHistoryRows?.traccar ?? historyData.filter((r) => r.source === 'traccar'),
+                count: sourceCounts?.traccar ?? 0,
+              },
+              {
+                key: 'iot',
+                title: 'IoT ESP32 (5Hz)',
+                color: '#F97316',
+                headerClass: 'ch-iot',
+                rows: sourceHistoryRows?.iot ?? historyData.filter((r) => r.source === 'iot'),
+                count: sourceCounts?.iot ?? 0,
+              },
+            ].map((tbl) => (
+              <div
+                key={tbl.key}
+                className="bg-[var(--bg-card)] border border-[var(--border)] rounded-[var(--r)] overflow-hidden shadow-[var(--shadow)] flex flex-col"
+              >
+                <div className={`comp-hdr ${tbl.headerClass} flex items-center justify-between gap-2 px-3 py-2.5 border-b border-[var(--border)]`}>
+                  <div className="flex items-center gap-2 min-w-0">
+                    {getSourceIcon(tbl.key)}
+                    <span className="font-bold text-xs truncate">{tbl.title}</span>
+                    <span
+                      className="text-[11px] font-inter font-bold px-2 py-0.5 rounded-full"
+                      style={{ backgroundColor: `${tbl.color}22`, color: tbl.color }}
+                    >
+                      {tbl.count.toLocaleString()} แถว
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    {onExportSource && (
+                      <button
+                        type="button"
+                        disabled={!!exportProgress || tbl.count === 0}
+                        onClick={() => onExportSource(tbl.key)}
+                        className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-secondary)] hover:bg-[var(--bg-card-hover)] text-[var(--text-1)] disabled:opacity-40"
+                        title={`Export CSV เฉพาะ ${tbl.title} ทั้งหมด (${tbl.count.toLocaleString()} แถว)`}
+                      >
+                        <Download size={11} /> CSV
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSplitByDeviceMode(false);
+                        onSourceTabChange?.(tbl.key);
+                      }}
+                      className="text-[11px] px-2 py-1 rounded border border-[var(--border)] bg-[var(--bg-secondary)] hover:bg-[var(--bg-card-hover)] text-[var(--text-2)]"
+                      title="ขยายดูตารางนี้แบบเต็มหน้าและเปิดดูย้อนหลังทุกหน้า"
+                    >
+                      ดูทั้งหมด
+                    </button>
+                  </div>
+                </div>
+                <div className="max-h-[320px] overflow-y-auto">
+                  <table className="w-full text-xs">
+                    <thead className="sticky top-0 bg-[var(--bg-primary)] z-10 text-left border-b border-[var(--border)]">
+                      <tr>
+                        <th className="p-2.5 font-semibold text-[var(--text-2)] uppercase text-[10px]">Device</th>
+                        <th className="p-2.5 font-semibold text-[var(--text-2)] uppercase text-[10px]">Lat / Lng</th>
+                        <th className="p-2.5 font-semibold text-[var(--text-2)] uppercase text-[10px]">Acc</th>
+                        <th className="p-2.5 font-semibold text-[var(--text-2)] uppercase text-[10px]">Time</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tbl.rows.length === 0 ? (
+                        <tr>
+                          <td colSpan={4} className="p-6 text-center text-[var(--text-3)]">
+                            ยังไม่มีข้อมูลในตารางนี้
+                          </td>
+                        </tr>
+                      ) : (
+                        tbl.rows.slice(0, 50).map((row) => {
+                          const rawTime = row.device_time || row.timestamp || row.recorded_at || row.updated_at || '';
+                          return (
+                            <tr
+                              key={row.id || `${row.device_id}_${rawTime}_${row.latitude}`}
+                              className="border-b border-[var(--row-alt)] hover:bg-[var(--bg-card-hover)] transition-colors"
+                            >
+                              <td className="p-2.5 truncate max-w-[110px]" title={row.device_id}>
+                                {row.device_id}
+                              </td>
+                              <td className="p-2.5 font-inter">
+                                {Number(row.latitude).toFixed(5)}, {Number(row.longitude).toFixed(5)}
+                              </td>
+                              <td className="p-2.5 text-[#06B6D4] font-inter">
+                                {row.accuracy ? `${Number(row.accuracy).toFixed(1)}m` : '—'}
+                              </td>
+                              <td className="p-2.5 text-[var(--text-3)] font-inter whitespace-nowrap">
+                                {formatTimeTH(rawTime)}
+                              </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="bg-[var(--bg-card)] border border-[var(--border)] rounded-[var(--r)] overflow-hidden shadow-[var(--shadow)]">
+            <div className="max-h-[340px] overflow-y-auto">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 bg-[var(--bg-primary)] z-10 text-left border-b border-[var(--border)]">
+                  <tr>
+                    <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Source</th>
+                    <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Device</th>
+                    <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Lat / Lng</th>
+                    <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Speed</th>
+                    <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Accuracy</th>
+                    <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Date</th>
+                    <th className="p-3 font-semibold text-[var(--text-2)] uppercase text-xs tracking-wider">Time</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {isHistoryLoading ? (
+                    <tr>
+                      <td colSpan={7} className="p-8 text-center text-[var(--text-3)]">กำลังโหลดข้อมูลหน้า {historyPage}...</td>
+                    </tr>
+                  ) : historyData.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="p-8 text-center text-[var(--text-3)]">No history records yet.</td>
+                    </tr>
+                  ) : (
+                    historyData.slice(0, historyPageSize).map((row) => {
+                      const rawTime = row.device_time || row.timestamp || row.recorded_at || row.updated_at || '';
+                      return (
+                        <tr key={row.id} className="border-b border-[var(--row-alt)] hover:bg-[var(--bg-card-hover)] transition-colors">
+                          <td className="p-3">
+                            <span className={`text-[10px] px-2 py-1 rounded-full border uppercase font-bold
+                              ${row.source === 'browser' ? 'bg-[#06B6D4]/10 text-[#06B6D4] border-[#06B6D4]/30' : 
+                                row.source === 'traccar' ? 'bg-[#8B5CF6]/10 text-[#8B5CF6] border-[#8B5CF6]/30' : 
+                                row.source === 'iot' ? 'bg-[#F97316]/10 text-[#F97316] border-[#F97316]/30' : 
+                                row.source === 'native' ? 'bg-[#10B981]/10 text-[#10B981] border-[#10B981]/30' :
+                                'bg-gray-500/10 text-gray-400 border-gray-500/30'}`}
+                            >
+                              {row.source}
+                            </span>
+                          </td>
+                          <td className="p-3">{row.device_id}</td>
+                          <td className="p-3 font-inter">{row.latitude.toFixed(5)}, {row.longitude.toFixed(5)}</td>
+                          <td className="p-3 text-[#F59E0B] font-inter">{(row.speed || 0).toFixed(1)}</td>
+                          <td className="p-3 text-[#06B6D4] font-inter">{row.accuracy ? `${row.accuracy.toFixed(1)}m` : '—'}</td>
+                          <td className="p-3 text-[var(--text-2)] font-inter">{formatDateTH(rawTime)}</td>
+                          <td className="p-3 text-[var(--text-3)] font-inter">{formatTimeTH(rawTime)}</td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

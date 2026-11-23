@@ -279,3 +279,18 @@ BEGIN
     ALTER PUBLICATION supabase_realtime ADD TABLE public.gps_history;
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
+
+-- 8. SQL Views แยกตารางตามอุปกรณ์/แหล่งข้อมูลสำหรับเปิดดูหรือ Export แยกใน Supabase Table Editor
+CREATE OR REPLACE VIEW public.gps_history_native AS
+SELECT * FROM public.gps_history WHERE source = 'native' ORDER BY COALESCE(device_time, server_time) DESC;
+
+CREATE OR REPLACE VIEW public.gps_history_traccar AS
+SELECT * FROM public.gps_history WHERE source = 'traccar' ORDER BY COALESCE(device_time, server_time) DESC;
+
+CREATE OR REPLACE VIEW public.gps_history_iot AS
+SELECT * FROM public.gps_history WHERE source = 'iot' ORDER BY COALESCE(device_time, server_time) DESC;
+
+GRANT SELECT ON public.gps_history_native TO anon, authenticated;
+GRANT SELECT ON public.gps_history_traccar TO anon, authenticated;
+GRANT SELECT ON public.gps_history_iot TO anon, authenticated;
+

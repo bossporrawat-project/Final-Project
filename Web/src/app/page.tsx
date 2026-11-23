@@ -113,6 +113,18 @@ export default function Dashboard() {
   const [historyPage, setHistoryPage] = useState(1);
   const [historyPageRows, setHistoryPageRows] = useState<Position[]>([]);
   const [isHistoryLoading, setIsHistoryLoading] = useState(false);
+  const [sourceHistoryRows, setSourceHistoryRows] = useState<{
+    native: Position[];
+    traccar: Position[];
+    iot: Position[];
+  }>({ native: [], traccar: [], iot: [] });
+  const [sourceCounts, setSourceCounts] = useState<{
+    all: number;
+    native: number;
+    traccar: number;
+    iot: number;
+  }>({ all: 0, native: 0, traccar: 0, iot: 0 });
+  const [exportProgress, setExportProgress] = useState<string | null>(null);
   const [serverCentroid, setServerCentroid] = useState<{ total: number; lat: number; lng: number } | null>(null);
   const [serverDeviceRows, setServerDeviceRows] = useState<DeviceAnalysisRow[] | null>(null);
   const histKeySetRef = useRef<Set<string>>(new Set());
@@ -137,7 +149,7 @@ export default function Dashboard() {
   };
 
   const appendHistoryPoint = useCallback((pt: Position, countAsNewDbInsert: boolean = true) => {
-    if (!pt || !pt.device_id || pt.source === 'browser' || (pt.latitude === 0 && pt.longitude === 0)) return;
+    if (!pt || !pt.device_id || pt.source === 'browser' || pt.device_id === 'Traccar_98615' || (pt.latitude === 0 && pt.longitude === 0)) return;
     const coordKey = makeCoordKey(pt);
     const idKey = pt.id ? String(pt.id) : coordKey;
     if (histKeySetRef.current.has(idKey) || histKeySetRef.current.has(coordKey)) return;
@@ -153,6 +165,21 @@ export default function Dashboard() {
       return next.length > MAX_IN_MEMORY_ROUTE_POINTS ? next.slice(0, MAX_IN_MEMORY_ROUTE_POINTS) : next;
     });
 
+    if (pt.source === 'native' || pt.source === 'traccar' || pt.source === 'iot') {
+      const srcKey = pt.source as 'native' | 'traccar' | 'iot';
+      setSourceHistoryRows(prev => ({
+        ...prev,
+        [srcKey]: [pt, ...prev[srcKey]].slice(0, HISTORY_PAGE_SIZE),
+      }));
+      if (countAsNewDbInsert) {
+        setSourceCounts(prev => ({
+          ...prev,
+          all: prev.all + 1,
+          [srcKey]: prev[srcKey] + 1,
+        }));
+      }
+    }
+
     if (countAsNewDbInsert) {
       const curFilter = filterRef.current;
       const matchesFilter =
@@ -166,6 +193,49 @@ export default function Dashboard() {
       }
     }
   }, [setHistArr]);
+
+  const loadSourceBreakdown = useCallback(async (clientOverride?: any, devFilterOverride?: string) => {
+    const activeClient = clientOverride || supabase;
+    if (!activeClient) return;
+    const devF = devFilterOverride ?? filterRef.current.dev;
+
+    const queryForSource = (src: 'native' | 'traccar' | 'iot') => {
+      let q = activeClient
+        .from('gps_history')
+        .select('*', { count: 'exact' })
+        .eq('source', src)
+        .neq('device_id', 'Traccar_98615');
+      if (devF !== 'all') q = q.eq('device_id', devF);
+      return q.order('server_time', { ascending: false, nullsFirst: false }).limit(HISTORY_PAGE_SIZE);
+    };
+
+    try {
+      const [nRes, tRes, iRes] = await Promise.all([
+        queryForSource('native'),
+        queryForSource('traccar'),
+        queryForSource('iot'),
+      ]);
+      const nRows = (nRes.data || []) as Position[];
+      const tRows = (tRes.data || []) as Position[];
+      const iRows = (iRes.data || []) as Position[];
+      [...nRows, ...tRows, ...iRows].forEach((r) => {
+        histKeySetRef.current.add(makeHistKey(r));
+        histKeySetRef.current.add(makeCoordKey(r));
+      });
+      setSourceHistoryRows({ native: nRows, traccar: tRows, iot: iRows });
+      const nCount = typeof nRes.count === 'number' ? nRes.count : nRows.length;
+      const tCount = typeof tRes.count === 'number' ? tRes.count : tRows.length;
+      const iCount = typeof iRes.count === 'number' ? iRes.count : iRows.length;
+      setSourceCounts({
+        all: nCount + tCount + iCount,
+        native: nCount,
+        traccar: tCount,
+        iot: iCount,
+      });
+    } catch {
+      // ignore transient error
+    }
+  }, [supabase]);
 
   const loadHistoryPage = useCallback(async (
     targetPage: number,
@@ -222,7 +292,6 @@ export default function Dashboard() {
 
     setMyDevice(name || 'ESP32_Tracker');
     initializeSupabase(url, key);
-    if (token) connectTraccar(token);
 
     return () => {
       if (livePollRef.current) {
@@ -231,6 +300,12 @@ export default function Dashboard() {
       }
     };
   }, []);
+
+  // Always connect with current DEFAULT_TRACCAR_TOKEN (and re-sync on HMR / Clear)
+  useEffect(() => {
+    localStorage.setItem('omni_traccar_token', DEFAULT_TRACCAR_TOKEN);
+    connectTraccar(DEFAULT_TRACCAR_TOKEN, 'demo3.traccar.org');
+  }, [connectTraccar, clearSignal]);
 
   const initializeSupabase = async (url: string, key: string) => {
     try {
@@ -259,9 +334,10 @@ export default function Dashboard() {
         })
       );
 
-      const [centroidRes, _pageRes, ...perDeviceRpcResults] = await Promise.all([
+      const [centroidRes, _pageRes, _srcBreakdownRes, ...perDeviceRpcResults] = await Promise.all([
         client.rpc('get_history_centroid'),
         loadHistoryPage(1, 'all', 'all', client),
+        loadSourceBreakdown(client, 'all'),
         ...perDeviceRpcQueries
       ]);
 
@@ -437,75 +513,121 @@ export default function Dashboard() {
     }
   };
 
-  // Sync Traccar positions to live view and Supabase
+  // Sync Traccar positions to live view and Supabase (handles both single live updates and bulk history backfill)
   useEffect(() => {
-    if (traccarPositions && traccarPositions.length > 0) {
-      traccarPositions.forEach((tp: any) => {
-        const devId = `Traccar_${tp.deviceId}`;
-        const rawTime = tp.deviceTime || tp.fixTime;
-        const devTime = rawTime ? new Date(rawTime).toISOString() : new Date().toISOString();
-        const now = new Date().toISOString();
-        const speedKmH = tp.speed ? parseFloat((tp.speed * 1.852).toFixed(1)) : 0;
-        
-        const pos: Position = {
+    if (!traccarPositions || traccarPositions.length === 0) return;
+    const validPositions = traccarPositions.filter(
+      (tp: any) => tp && String(tp.deviceId) !== '98615' && (tp.latitude !== 0 || tp.longitude !== 0)
+    );
+    if (validPositions.length === 0) return;
+
+    const now = new Date().toISOString();
+    const latestByDev: Record<string, Position> = {};
+    const historyToUpsert: any[] = [];
+
+    validPositions.forEach((tp: any) => {
+      const devId = `Traccar_${tp.deviceId}`;
+      const rawTime = tp.fixTime || tp.deviceTime;
+      const devTime = rawTime ? new Date(rawTime).toISOString() : now;
+      const srvTime = tp.serverTime ? new Date(tp.serverTime).toISOString() : now;
+      const speedKmH = tp.speed ? parseFloat((tp.speed * 1.852).toFixed(1)) : 0;
+
+      const pos: Position = {
+        device_id: devId,
+        device_name: devId,
+        latitude: tp.latitude,
+        longitude: tp.longitude,
+        speed: speedKmH,
+        accuracy: tp.accuracy || null,
+        source: 'traccar',
+        is_online: true,
+        device_time: devTime,
+        server_time: srvTime,
+        updated_at: now,
+      };
+
+      const prevLatest = latestByDev[devId];
+      if (!prevLatest || new Date(devTime).getTime() >= new Date(prevLatest.device_time || 0).getTime()) {
+        latestByDev[devId] = pos;
+      }
+
+      const last = lastTraccarRecordRef.current[devId];
+      const isBulkBackfill = validPositions.length > 1;
+      const dist = last ? haversine(last.lat, last.lng, tp.latitude, tp.longitude) : 999;
+      const elapsed = last ? Date.now() - last.time : 999999;
+
+      if (isBulkBackfill || !last || last.devTime !== devTime || dist > 1 || elapsed > 10000) {
+        lastTraccarRecordRef.current[devId] = { lat: tp.latitude, lng: tp.longitude, time: Date.now(), devTime };
+        appendHistoryPoint(
+          {
+            id: `local_${devId}_${devTime}`,
+            device_id: devId,
+            latitude: tp.latitude,
+            longitude: tp.longitude,
+            speed: speedKmH,
+            accuracy: tp.accuracy || null,
+            source: 'traccar',
+            device_time: devTime,
+            server_time: srvTime,
+          },
+          !isBulkBackfill
+        );
+        historyToUpsert.push({
           device_id: devId,
-          device_name: devId,
           latitude: tp.latitude,
           longitude: tp.longitude,
           speed: speedKmH,
           accuracy: tp.accuracy || null,
           source: 'traccar',
-          is_online: true,
           device_time: devTime,
-          server_time: now,
-          updated_at: now
-        };
+          server_time: srvTime,
+        });
+      }
+    });
 
-        setLivePos(prev => ({ ...prev, [devId]: pos }));
+    setLivePos((prev) => ({ ...prev, ...latestByDev }));
 
-        if (supabase && isTrack) {
-          supabase.from('gps_positions').upsert({
-            device_id: devId, device_name: devId,
-            latitude: tp.latitude, longitude: tp.longitude,
-            speed: speedKmH, accuracy: tp.accuracy || null,
-            source: 'traccar', is_online: true,
-            device_time: devTime, server_time: now, updated_at: now
-          }, { onConflict: 'device_id' }).then();
-
-          const last = lastTraccarRecordRef.current[devId];
-          const dist = last ? haversine(last.lat, last.lng, tp.latitude, tp.longitude) : 999;
-          const elapsed = last ? (Date.now() - last.time) : 999999;
-
-          if (!last || last.devTime !== devTime || dist > 1 || elapsed > 10000) {
-            lastTraccarRecordRef.current[devId] = { lat: tp.latitude, lng: tp.longitude, time: Date.now(), devTime };
-            appendHistoryPoint({
-              id: `local_${devId}_${devTime}`,
-              device_id: devId,
-              latitude: tp.latitude,
-              longitude: tp.longitude,
-              speed: speedKmH,
-              accuracy: tp.accuracy || null,
+    if (supabase && isTrack) {
+      Object.values(latestByDev).forEach((pos) => {
+        supabase
+          .from('gps_positions')
+          .upsert(
+            {
+              device_id: pos.device_id,
+              device_name: pos.device_name,
+              latitude: pos.latitude,
+              longitude: pos.longitude,
+              speed: pos.speed,
+              accuracy: pos.accuracy,
               source: 'traccar',
-              device_time: devTime,
-              server_time: now
-            });
-            supabase.from('gps_history').upsert({
-              device_id: devId,
-              latitude: tp.latitude,
-              longitude: tp.longitude,
-              speed: speedKmH,
-              accuracy: tp.accuracy || null,
-              source: 'traccar',
-              device_time: devTime,
-              server_time: now
-            }, { onConflict: 'device_id,device_time' }).then(({ error }: any) => {
-              if (error) console.error('Insert Traccar gps_history error:', error);
-            });
-          }
-        }
+              is_online: true,
+              device_time: pos.device_time,
+              server_time: pos.server_time,
+              updated_at: now,
+            },
+            { onConflict: 'device_id' }
+          )
+          .then();
       });
+
+      if (historyToUpsert.length > 0) {
+        // Deduplicate by device_id + device_time before batch upserting
+        const dedupMap = new Map<string, any>();
+        historyToUpsert.forEach((row) => dedupMap.set(`${row.device_id}|${row.device_time}`, row));
+        const uniqueRows = Array.from(dedupMap.values());
+        (async () => {
+          const chunkSize = 250;
+          for (let i = 0; i < uniqueRows.length; i += chunkSize) {
+            const chunk = uniqueRows.slice(i, i + chunkSize);
+            await supabase.from('gps_history').upsert(chunk, { onConflict: 'device_id,device_time' });
+          }
+          if (uniqueRows.length > 1) {
+            loadSourceBreakdown(supabase);
+          }
+        })();
+      }
     }
-  }, [traccarPositions, supabase, isTrack, setLivePos, appendHistoryPoint]);
+  }, [traccarPositions, supabase, isTrack, setLivePos, appendHistoryPoint, loadSourceBreakdown]);
 
   // Handlers
   const toggleTracking = () => setIsTrack(!isTrack);
@@ -522,6 +644,8 @@ export default function Dashboard() {
     setHistArr([]);
     setHistoryPageRows([]);
     setTotalHistoryCount(0);
+    setSourceHistoryRows({ native: [], traccar: [], iot: [] });
+    setSourceCounts({ all: 0, native: 0, traccar: 0, iot: 0 });
     setHistoryPage(1);
     setServerCentroid(null);
     setServerDeviceRows(null);
@@ -883,68 +1007,98 @@ export default function Dashboard() {
     setRefLng('');
   };
 
-  const handleExportCSV = async () => {
+  const handleExportCSV = async (overrideSrc?: string) => {
+    const targetSrc = typeof overrideSrc === 'string' && overrideSrc.length > 0 ? overrideSrc : filter.src;
+    if (exportProgress) return;
+    setExportProgress('กำลังดึงข้อมูล 0 แถว...');
+
     let exportRows: any[] = [];
-    if (supabase) {
-      const fetchBySource = async (src: string, maxRows: number) => {
-        const rows: any[] = [];
-        const chunkSize = 1000;
-        for (let offset = 0; offset < maxRows; offset += chunkSize) {
-          let query = supabase.from('gps_history').select('*').eq('source', src);
-          if (filter.dev !== 'all') query = query.eq('device_id', filter.dev);
-          const { data, error } = await query
-            .order('server_time', { ascending: false, nullsFirst: false })
-            .range(offset, offset + chunkSize - 1);
-          if (error || !Array.isArray(data) || data.length === 0) break;
-          rows.push(...data);
-          if (data.length < chunkSize) break;
-        }
-        return rows;
-      };
+    try {
+      if (supabase) {
+        let totalFetchedSoFar = 0;
+        const fetchAllForSource = async (src: string) => {
+          const rows: any[] = [];
+          const chunkSize = 1000;
+          let offset = 0;
+          // Loop until all rows for this source are fetched (no artificial row cap)
+          while (true) {
+            let query = supabase
+              .from('gps_history')
+              .select('*')
+              .eq('source', src)
+              .neq('device_id', 'Traccar_98615');
+            if (filter.dev !== 'all') query = query.eq('device_id', filter.dev);
+            const { data, error } = await query
+              .order('device_time', { ascending: false, nullsFirst: false })
+              .order('id', { ascending: false })
+              .range(offset, offset + chunkSize - 1);
+            if (error || !Array.isArray(data) || data.length === 0) break;
+            rows.push(...data);
+            totalFetchedSoFar += data.length;
+            setExportProgress(`กำลังดึงข้อมูล... ${totalFetchedSoFar.toLocaleString()} แถว`);
+            if (data.length < chunkSize) break;
+            offset += chunkSize;
+          }
+          return rows;
+        };
 
-      if (filter.src !== 'all') {
-        exportRows = await fetchBySource(filter.src, MAX_CSV_EXPORT_ROWS);
-      } else {
-        // Fetch each source in parallel so high-frequency 5Hz IoT never crowds out Native or Traccar
-        const [nativeRows, traccarRows, iotRows] = await Promise.all([
-          fetchBySource('native', 30000),
-          fetchBySource('traccar', 30000),
-          fetchBySource('iot', 40000),
-        ]);
-        exportRows = [...nativeRows, ...traccarRows, ...iotRows].sort((a, b) => {
-          const ta = new Date(a.device_time || a.server_time || 0).getTime();
-          const tb = new Date(b.device_time || b.server_time || 0).getTime();
-          return tb - ta;
-        });
-      }
-    }
-    if (exportRows.length === 0) exportRows = filteredHist;
-    if (exportRows.length === 0) {
-      alert("ไม่มีข้อมูล History สำหรับ Export");
-      return;
-    }
-
-    const headers = "id,device_id,source,latitude,longitude,speed,accuracy,recorded_date,recorded_time,device_time,server_time\n";
-    const csv = headers + exportRows.map(d => {
-      const rawTime = d.device_time || d.recorded_at || d.updated_at || '';
-      let dateStr = '';
-      let timeStr = '';
-      if (rawTime) {
-        const dt = new Date(rawTime);
-        if (!isNaN(dt.getTime())) {
-          dateStr = dt.toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' });
-          timeStr = dt.toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour12: false });
+        if (targetSrc !== 'all') {
+          exportRows = await fetchAllForSource(targetSrc);
+        } else {
+          // Fetch 100% of rows for each source in parallel so high-frequency 5Hz IoT never truncates Native or Traccar
+          const [nativeRows, traccarRows, iotRows] = await Promise.all([
+            fetchAllForSource('native'),
+            fetchAllForSource('traccar'),
+            fetchAllForSource('iot'),
+          ]);
+          exportRows = [...nativeRows, ...traccarRows, ...iotRows].sort((a, b) => {
+            const ta = new Date(a.device_time || a.server_time || 0).getTime();
+            const tb = new Date(b.device_time || b.server_time || 0).getTime();
+            return tb - ta;
+          });
         }
       }
-      return `${d.id},${d.device_id},${d.source},${d.latitude},${d.longitude},${d.speed},${d.accuracy},${dateStr},${timeStr},${d.device_time || d.recorded_at || ''},${d.server_time || d.updated_at || ''}`;
-    }).join("\n");
+      if (exportRows.length === 0) {
+        exportRows =
+          targetSrc === 'all'
+            ? filteredHist
+            : filteredHist.filter((r) => r.source === targetSrc);
+      }
+      if (exportRows.length === 0) {
+        alert('ไม่มีข้อมูล History สำหรับ Export');
+        return;
+      }
 
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `omni_history_${new Date().getTime()}.csv`;
-    a.click();
+      const headers =
+        'id,device_id,source,latitude,longitude,speed,accuracy,recorded_date,recorded_time,device_time,server_time\n';
+      const csvBody = exportRows
+        .map((d) => {
+          const rawTime = d.device_time || d.recorded_at || d.updated_at || '';
+          let dateStr = '';
+          let timeStr = '';
+          if (rawTime) {
+            const dt = new Date(rawTime);
+            if (!isNaN(dt.getTime())) {
+              dateStr = dt.toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' });
+              timeStr = dt.toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour12: false });
+            }
+          }
+          return `${d.id},${d.device_id},${d.source},${d.latitude},${d.longitude},${d.speed ?? 0},${d.accuracy ?? ''},${dateStr},${timeStr},${d.device_time || d.recorded_at || ''},${d.server_time || d.updated_at || ''}`;
+        })
+        .join('\n');
+
+      // Prepend UTF-8 BOM (\uFEFF) so Excel on Windows reads Thai characters and columns cleanly
+      const blob = new Blob(['\uFEFF' + headers + csvBody], { type: 'text/csv;charset=utf-8;' });
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const suffix = targetSrc === 'all' ? 'all_sources' : targetSrc;
+      a.download = `omni_history_${suffix}_${exportRows.length}rows_${new Date().getTime()}.csv`;
+      a.click();
+      window.URL.revokeObjectURL(url);
+    } finally {
+      setExportProgress(null);
+    }
   };
 
   const handleToggleAnalysis = () => {
@@ -976,11 +1130,12 @@ export default function Dashboard() {
         onFilterChange={(src, dev) => {
           setFilter({ src, dev });
           loadHistoryPage(1, src, dev);
+          loadSourceBreakdown(supabase, dev);
         }}
         currentSrc={filter.src}
         currentDev={filter.dev}
         deviceOptions={deviceOptions}
-        onExport={handleExportCSV}
+        onExport={() => handleExportCSV()}
         onClear={handleClear}
         onToggleAnalysis={handleToggleAnalysis}
       />
@@ -990,7 +1145,7 @@ export default function Dashboard() {
       <DataTables
         liveData={filteredLive as any}
         historyData={(historyPageRows.length > 0 || totalHistoryCount > 0 ? historyPageRows : filteredHist) as any}
-        totalHistoryCount={totalHistoryCount || filteredHist.length}
+        totalHistoryCount={sourceCounts.all || totalHistoryCount || filteredHist.length}
         historyPage={historyPage}
         historyPageSize={HISTORY_PAGE_SIZE}
         onHistoryPageChange={(nextPage) => loadHistoryPage(nextPage, filter.src, filter.dev)}
@@ -998,13 +1153,22 @@ export default function Dashboard() {
         onLoadArchivedPoints={(rows) => {
           rows.forEach((r) => appendHistoryPoint(r, false));
         }}
+        sourceHistoryRows={sourceHistoryRows as any}
+        sourceCounts={sourceCounts}
+        currentSrcFilter={filter.src}
+        onSourceTabChange={(nextSrc) => {
+          setFilter({ src: nextSrc, dev: filter.dev });
+          loadHistoryPage(1, nextSrc, filter.dev);
+        }}
+        onExportSource={(targetSrc) => handleExportCSV(targetSrc)}
+        exportProgress={exportProgress}
       />
 
       <AnalysisPanel 
         isVisible={isAnalysisOpen}
         onClose={() => setIsAnalysisOpen(false)}
         onRunAnalysis={handleRunAnalysis}
-        onExportCSV={handleExportCSV}
+        onExportCSV={() => handleExportCSV()}
         onReset={handleResetAnalysis}
         refMode={refMode}
         onRefModeChange={(mode) => {
