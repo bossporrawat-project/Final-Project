@@ -35,7 +35,6 @@ export function useHistory() {
 export function useTrackingSettings() {
   const [filter, setFilter] = useState<FilterState>({ src: 'all', dev: 'all' });
   const [isTrack, setIsTrack] = useState<boolean>(true);
-  const [gpsOn, setGpsOn] = useState<boolean>(false);
 
-  return { filter, setFilter, isTrack, setIsTrack, gpsOn, setGpsOn };
+  return { filter, setFilter, isTrack, setIsTrack };
 }

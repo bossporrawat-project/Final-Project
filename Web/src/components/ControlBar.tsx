@@ -1,11 +1,9 @@
 import React from 'react';
-import { Play, Pause, Navigation, Download, Trash2, BarChart2, Filter, Smartphone } from 'lucide-react';
+import { Play, Pause, Download, Trash2, BarChart2, Filter, Smartphone } from 'lucide-react';
 
 interface ControlBarProps {
   isTracking: boolean;
-  gpsOn: boolean;
   onToggleTracking: () => void;
-  onToggleBrowserGPS: () => void;
   onFilterChange: (src: string, dev: string) => void;
   currentSrc: string;
   currentDev: string;
@@ -17,9 +15,7 @@ interface ControlBarProps {
 
 export default function ControlBar({
   isTracking,
-  gpsOn,
   onToggleTracking,
-  onToggleBrowserGPS,
   onFilterChange,
   currentSrc,
   currentDev,
@@ -38,15 +34,6 @@ export default function ControlBar({
         {isTracking ? 'Stop' : 'Start'}
       </button>
       
-      <button 
-        className="btn" 
-        onClick={onToggleBrowserGPS}
-        style={{ borderColor: gpsOn ? 'var(--cyan)' : '', color: gpsOn ? 'var(--cyan)' : '' }}
-      >
-        <Navigation size={16} />
-        {gpsOn ? 'GPS: ON' : 'GPS: OFF'}
-      </button>
-      
       <div className="sep"></div>
       
       <div className="flex items-center gap-2 bg-[var(--bg-primary)] border border-[var(--border)] rounded-[var(--rs)] px-2">
@@ -59,7 +46,6 @@ export default function ControlBar({
         >
           <option value="all">All Sources</option>
           <option value="native">Native (Android)</option>
-          <option value="browser">Browser</option>
           <option value="iot">IoT</option>
           <option value="traccar">Traccar</option>
         </select>

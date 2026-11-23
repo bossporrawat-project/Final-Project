@@ -8,9 +8,7 @@ import DataTables from '@/components/DataTables';
 import AnalysisPanel, { ReferenceMode, DeviceAnalysisRow } from '@/components/AnalysisPanel';
 
 import { useLivePositions, useHistory, useTrackingSettings, Position } from '@/hooks/useOmniState';
-import { useBrowserGPS } from '@/hooks/useBrowserGPS';
 import { useTraccar } from '@/hooks/useTraccar';
-import { useIoT } from '@/hooks/useIoT';
 import { getSupabaseClient } from '@/lib/supabaseClient';
 import {
   haversine,
@@ -104,12 +102,10 @@ export default function Dashboard() {
   // States from hooks
   const { livePos, setLivePos } = useLivePositions();
   const { histArr, setHistArr } = useHistory();
-  const { filter, setFilter, isTrack, setIsTrack, gpsOn, setGpsOn } = useTrackingSettings();
+  const { filter, setFilter, isTrack, setIsTrack } = useTrackingSettings();
 
   // Connection hooks
-  const { startGPS, stopGPS, position: gpsPosition, gpsOn: browserGpsActive, error: gpsError } = useBrowserGPS();
   const { connect: connectTraccar, disconnect: disconnectTraccar, positions: traccarPositions, isConnected: traccarConnected, error: traccarError } = useTraccar();
-  const { positions: iotPositions } = useIoT(true);
 
   const [supabase, setSupabase] = useState<any>(null);
   const [clearSignal, setClearSignal] = useState(0);
@@ -129,7 +125,7 @@ export default function Dashboard() {
   };
 
   const appendHistoryPoint = useCallback((pt: Position, countAsNewDbInsert: boolean = false) => {
-    if (!pt || !pt.device_id || (pt.latitude === 0 && pt.longitude === 0)) return;
+    if (!pt || !pt.device_id || pt.source === 'browser' || (pt.latitude === 0 && pt.longitude === 0)) return;
     const ptTime = pt.device_time || pt.recorded_at || pt.updated_at || '';
     const coordKey = `${pt.device_id}_${ptTime}_${Number(pt.latitude).toFixed(6)}_${Number(pt.longitude).toFixed(6)}`;
     const idKey = pt.id ? String(pt.id) : coordKey;
@@ -165,7 +161,8 @@ export default function Dashboard() {
     try {
       let query = activeClient
         .from('gps_history')
-        .select('*', { count: 'exact' });
+        .select('*', { count: 'exact' })
+        .neq('source', 'browser');
       if (srcFilter !== 'all') query = query.eq('source', srcFilter);
       if (devFilter !== 'all') query = query.eq('device_id', devFilter);
       const from = (safePage - 1) * HISTORY_PAGE_SIZE;
@@ -183,12 +180,6 @@ export default function Dashboard() {
       setIsHistoryLoading(false);
     }
   }, [supabase]);
-
-  useEffect(() => {
-    if (gpsError && !gpsError.toLowerCase().includes('timeout')) {
-      alert(`⚠️ Browser GPS Error:\n${gpsError}\n\nPlease check your browser's location permissions or Windows location settings.`);
-    }
-  }, [gpsError]);
 
   // Apply theme & lang to DOM
   useEffect(() => {
@@ -227,10 +218,12 @@ export default function Dashboard() {
       setSupabase(client);
       setSupaStatus(true);
       // Fetch initial live positions ordered by actual server arrival time
-      const { data: liveData } = await client
+      const { data: rawLiveData } = await client
         .from('gps_positions')
         .select('*')
+        .neq('source', 'browser')
         .order('updated_at', { ascending: false, nullsFirst: false });
+      const liveData = (rawLiveData || []).filter((r: any) => r?.source !== 'browser');
 
       // Call server-side downsampling RPC per device (p_points_per_device: 300 guarantees <= 599 rows < PostgREST 1000 cap even at 1M+ rows/device)
       const perDeviceRpcQueries = (liveData || []).map((dev: any) =>
@@ -269,6 +262,7 @@ export default function Dashboard() {
         perDeviceRpcResults.forEach((res: any) => {
           if (!res?.error && Array.isArray(res?.data)) {
             res.data.forEach((row: any) => {
+              if (row?.source === 'browser') return;
               const key = makeHistKey(row);
               if (!mergedRpcMap.has(key)) mergedRpcMap.set(key, row);
             });
@@ -299,6 +293,7 @@ export default function Dashboard() {
         const ingestHistRows = (rows?: any[] | null) => {
           if (!Array.isArray(rows)) return;
           rows.forEach((row) => {
+            if (row?.source === 'browser') return;
             const key = makeHistKey(row);
             if (!mergedMap.has(key)) mergedMap.set(key, row);
           });
@@ -338,7 +333,7 @@ export default function Dashboard() {
       client.removeAllChannels();
 
       const applyIncomingLiveRow = (r: any) => {
-        if (!r || !r.device_id) return;
+        if (!r || !r.device_id || r.source === 'browser') return;
         const sig = `${r.updated_at || ''}|${r.device_time || ''}|${r.latitude}|${r.longitude}|${r.speed}`;
         if (lastSeenSigByDev[r.device_id] === sig) return;
         lastSeenSigByDev[r.device_id] = sig;
@@ -390,79 +385,6 @@ export default function Dashboard() {
       setSupaStatus(false);
     }
   };
-
-  const handleChangeDeviceName = () => {
-    const newName = window.prompt('กรุณาระบุชื่อ Device ใหม่สำหรับ Browser:', myDevice);
-    if (newName && newName.trim() !== '') {
-      const trimmed = newName.trim();
-      localStorage.setItem('omni_device_name', trimmed);
-      setMyDevice(trimmed);
-    }
-  };
-
-  // Sync GPS to live view immediately & persist to Supabase when tracking is active
-  useEffect(() => {
-    if (!gpsPosition) return;
-    const now = new Date().toISOString();
-    const devTime = gpsPosition.timestamp || now;
-
-    // Update Browser card & map immediately without waiting for Supabase Realtime round-trip
-    setLivePos(prev => ({
-      ...prev,
-      [myDevice]: {
-        device_id: myDevice,
-        device_name: myDevice,
-        latitude: gpsPosition.latitude,
-        longitude: gpsPosition.longitude,
-        speed: gpsPosition.speed,
-        accuracy: gpsPosition.accuracy,
-        source: 'browser',
-        is_online: true,
-        device_time: devTime,
-        server_time: now,
-        updated_at: now
-      }
-    }));
-
-    if (supabase && isTrack) {
-      // 1. Always update live position heartbeat
-      supabase.from('gps_positions').upsert({
-        device_id: myDevice, device_name: myDevice,
-        latitude: gpsPosition.latitude, longitude: gpsPosition.longitude,
-        speed: gpsPosition.speed, accuracy: gpsPosition.accuracy,
-        source: 'browser', is_online: true,
-        device_time: devTime, server_time: now, updated_at: now
-      }, { onConflict: 'device_id' }).then();
-      
-      // 2. Only record into history if moved > 3 meters or > 30s elapsed
-      const last = lastHistoryRecordRef.current;
-      const dist = last ? haversine(last.lat, last.lng, gpsPosition.latitude, gpsPosition.longitude) : 999;
-      const elapsed = last ? (Date.now() - last.time) : 999999;
-
-      if (!last || dist > 3 || elapsed > 30000) {
-        lastHistoryRecordRef.current = { lat: gpsPosition.latitude, lng: gpsPosition.longitude, time: Date.now() };
-        appendHistoryPoint({
-          id: `local_${myDevice}_${devTime}`,
-          device_id: myDevice,
-          latitude: gpsPosition.latitude,
-          longitude: gpsPosition.longitude,
-          speed: gpsPosition.speed,
-          accuracy: gpsPosition.accuracy,
-          source: 'browser',
-          device_time: devTime,
-          server_time: now
-        });
-        supabase.from('gps_history').insert({
-          device_id: myDevice, latitude: gpsPosition.latitude, longitude: gpsPosition.longitude,
-          speed: gpsPosition.speed, accuracy: gpsPosition.accuracy,
-          source: 'browser',
-          device_time: devTime, server_time: now
-        }).then(({ error }: any) => {
-          if (error) console.error('Insert gps_history error:', error);
-        });
-      }
-    }
-  }, [gpsPosition, supabase, isTrack, myDevice, appendHistoryPoint, setLivePos]);
 
   // Sync Traccar positions to live view and Supabase
   useEffect(() => {
@@ -534,86 +456,8 @@ export default function Dashboard() {
     }
   }, [traccarPositions, supabase, isTrack, setLivePos, appendHistoryPoint]);
 
-  // Sync IoT (ESP32 from Firebase iot-project-c13c9) positions to live view and Supabase
-  useEffect(() => {
-    if (iotPositions && iotPositions.length > 0) {
-      iotPositions.forEach((ip) => {
-        const devId = ip.deviceId;
-        const now = new Date().toISOString();
-        let devTime = now;
-        if (ip.timeStr && /^\d{2}:\d{2}:\d{2}$/.test(ip.timeStr)) {
-          const todayBkk = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Bangkok' });
-          const parsed = new Date(`${todayBkk}T${ip.timeStr}+07:00`);
-          if (!isNaN(parsed.getTime())) devTime = parsed.toISOString();
-        } else if (ip.timeStr) {
-          const parsed = new Date(ip.timeStr);
-          if (!isNaN(parsed.getTime())) devTime = parsed.toISOString();
-        }
-
-        const pos: Position = {
-          device_id: devId,
-          device_name: devId,
-          latitude: ip.latitude,
-          longitude: ip.longitude,
-          speed: ip.speed,
-          accuracy: ip.accuracy,
-          source: 'iot',
-          is_online: true,
-          device_time: devTime,
-          server_time: now,
-          updated_at: now
-        };
-
-        setLivePos(prev => ({ ...prev, [devId]: pos }));
-
-        if (supabase && isTrack) {
-          const last = lastIoTRecordRef.current[devId];
-          const isChanged = !last || last.timeStr !== ip.timeStr || haversine(last.lat, last.lng, ip.latitude, ip.longitude) > 1;
-          if (isChanged) {
-            lastIoTRecordRef.current[devId] = { lat: ip.latitude, lng: ip.longitude, timeStr: ip.timeStr, time: Date.now() };
-            appendHistoryPoint({
-              id: `local_${devId}_${devTime}`,
-              device_id: devId,
-              latitude: ip.latitude,
-              longitude: ip.longitude,
-              speed: ip.speed,
-              accuracy: ip.accuracy,
-              source: 'iot',
-              device_time: devTime,
-              server_time: now
-            });
-            supabase.from('gps_positions').upsert({
-              device_id: devId, device_name: devId,
-              latitude: ip.latitude, longitude: ip.longitude,
-              speed: ip.speed, accuracy: ip.accuracy,
-              source: 'iot', is_online: true,
-              device_time: devTime, server_time: now, updated_at: now
-            }, { onConflict: 'device_id' }).then();
-
-            supabase.from('gps_history').upsert({
-              device_id: devId,
-              latitude: ip.latitude,
-              longitude: ip.longitude,
-              speed: ip.speed,
-              accuracy: ip.accuracy,
-              source: 'iot',
-              device_time: devTime,
-              server_time: now
-            }, { onConflict: 'device_id,device_time' }).then(({ error }: any) => {
-              if (error) console.error('Insert IoT gps_history error:', error);
-            });
-          }
-        }
-      });
-    }
-  }, [iotPositions, supabase, isTrack, setLivePos, appendHistoryPoint]);
-
   // Handlers
   const toggleTracking = () => setIsTrack(!isTrack);
-  const toggleBrowserGPS = () => {
-    if (browserGpsActive) { stopGPS(); setGpsOn(false); }
-    else { startGPS(); setGpsOn(true); }
-  };
   
   const handleClear = async () => {
     if (!supabase || !confirm('⚠️ ลบประวัติเส้นทางทั้งหมด?')) return;
@@ -634,14 +478,13 @@ export default function Dashboard() {
   };
 
   // Data processing
-  const liveValues = Object.values(livePos);
+  const liveValues = Object.values(livePos).filter(p => p.source !== 'browser');
   const filteredLive = liveValues.filter(p => (filter.src === 'all' || p.source === filter.src) && (filter.dev === 'all' || p.device_id === filter.dev));
-  const filteredHist = histArr.filter(p => (filter.src === 'all' || p.source === filter.src) && (filter.dev === 'all' || p.device_id === filter.dev));
+  const filteredHist = histArr.filter(p => p.source !== 'browser' && (filter.src === 'all' || p.source === filter.src) && (filter.dev === 'all' || p.device_id === filter.dev));
 
   const stats = {
     all: liveValues.length,
     native: liveValues.filter(p => p.source === 'native').length,
-    browser: liveValues.filter(p => p.source === 'browser').length,
     iot: liveValues.filter(p => p.source === 'iot').length,
     traccar: liveValues.filter(p => p.source === 'traccar').length
   };
@@ -687,14 +530,6 @@ export default function Dashboard() {
       } else {
         statusMsg = targetId ? `❌ ไม่พบพิกัดของ "${targetId}"` : 'ยังไม่มี Device ให้เลือก';
       }
-    } else if (refMode === 'gps') {
-      if (gpsPosition && isValidCoord(gpsPosition)) {
-        resolvedLat = gpsPosition.latitude;
-        resolvedLng = gpsPosition.longitude;
-        statusMsg = '✓ ใช้พิกัด Browser GPS สดอัตโนมัติ';
-      } else {
-        statusMsg = '📡 กำลังรอสัญญาณ Browser GPS...';
-      }
     } else if (refMode === 'kml') {
       if (kmlRoute && kmlRoute.points.length > 0) {
         const mid = kmlRoute.points[Math.floor(kmlRoute.points.length / 2)];
@@ -717,7 +552,7 @@ export default function Dashboard() {
     }
 
     return { resolvedLat, resolvedLng, statusMsg, validHist, validLive };
-  }, [analysisTick, refMode, refDeviceId, refLat, refLng, gpsPosition, histArr, liveValues, deviceOptions, serverCentroid, totalHistoryCount, kmlRoute]);
+  }, [analysisTick, refMode, refDeviceId, refLat, refLng, histArr, liveValues, deviceOptions, serverCentroid, totalHistoryCount, kmlRoute]);
 
   // Query server-side million-row SQL analysis RPC whenever Analysis is open and reference changes
   useEffect(() => {
@@ -739,16 +574,18 @@ export default function Dashboard() {
           p_ref_lng: resolvedLng
         });
         if (!cancelled && !error && Array.isArray(data) && data.length > 0) {
-          const mapped: DeviceAnalysisRow[] = data.map((r: any) => ({
-            deviceId: r.device_id,
-            source: r.source || 'unknown',
-            samples: Number(r.samples) || 0,
-            meanError: Number(r.mean_error) || 0,
-            stdDev: Number(r.std_dev) || 0,
-            min: Number(r.min_error) || 0,
-            max: Number(r.max_error) || 0,
-            avgAcc: r.avg_acc != null ? Number(r.avg_acc) : '-'
-          }));
+          const mapped: DeviceAnalysisRow[] = data
+            .filter((r: any) => r.source !== 'browser')
+            .map((r: any) => ({
+              deviceId: r.device_id,
+              source: r.source || 'unknown',
+              samples: Number(r.samples) || 0,
+              meanError: Number(r.mean_error) || 0,
+              stdDev: Number(r.std_dev) || 0,
+              min: Number(r.min_error) || 0,
+              max: Number(r.max_error) || 0,
+              avgAcc: r.avg_acc != null ? Number(r.avg_acc) : '-'
+            }));
           setServerDeviceRows(mapped);
         } else if (!cancelled && error) {
           setServerDeviceRows(null);
@@ -773,7 +610,6 @@ export default function Dashboard() {
         displayLat: refMode === 'manual' ? refLat : '',
         displayLng: refMode === 'manual' ? refLng : '',
         statusMsg,
-        browserStats: DEFAULT_ANALYSIS_STATS,
         traccarStats: DEFAULT_ANALYSIS_STATS,
         iotStats: DEFAULT_ANALYSIS_STATS,
         nativeStats: DEFAULT_ANALYSIS_STATS,
@@ -801,7 +637,6 @@ export default function Dashboard() {
     });
 
     let deviceRows: DeviceAnalysisRow[];
-    let bs: AnalysisStats;
     let ts: AnalysisStats;
     let is: AnalysisStats;
     let ns: AnalysisStats;
@@ -853,14 +688,12 @@ export default function Dashboard() {
           barWidth: 0
         };
       };
-      bs = aggregateSource('browser');
       ts = aggregateSource('traccar');
       is = aggregateSource('iot');
       ns = aggregateSource('native');
       const totalAnalyzed = serverDeviceRows.reduce((s, r) => s + r.samples, 0);
       finalStatus = `${statusMsg} • คำนวณ SQL เต็มฐานข้อมูล ${totalAnalyzed.toLocaleString()} แถว`;
     } else {
-      bs = computeStatsForPoints(getSourcePoints('browser'), resolvedLat, resolvedLng, activeKmlPoints);
       ts = computeStatsForPoints(getSourcePoints('traccar'), resolvedLat, resolvedLng, activeKmlPoints);
       is = computeStatsForPoints(getSourcePoints('iot'), resolvedLat, resolvedLng, activeKmlPoints);
       ns = computeStatsForPoints(getSourcePoints('native'), resolvedLat, resolvedLng, activeKmlPoints);
@@ -900,7 +733,6 @@ export default function Dashboard() {
       { src: 'iot', label: 'IoT Data', stats: is },
       { src: 'traccar', label: 'API (Traccar)', stats: ts },
       { src: 'native', label: 'Native (Android)', stats: ns },
-      { src: 'browser', label: 'Browser GPS', stats: bs },
     ];
     for (const col of sourceColumns) {
       const pts = getSourcePoints(col.src);
@@ -924,13 +756,11 @@ export default function Dashboard() {
     }
 
     const maxGlobalError = Math.max(
-      typeof bs.meanError === 'number' ? bs.meanError : 0,
       typeof ts.meanError === 'number' ? ts.meanError : 0,
       typeof is.meanError === 'number' ? is.meanError : 0,
       typeof ns.meanError === 'number' ? ns.meanError : 0
     );
     if (maxGlobalError > 0) {
-      if (typeof bs.meanError === 'number') bs.barWidth = Math.min(100, (bs.meanError / maxGlobalError) * 100);
       if (typeof ts.meanError === 'number') ts.barWidth = Math.min(100, (ts.meanError / maxGlobalError) * 100);
       if (typeof is.meanError === 'number') is.barWidth = Math.min(100, (is.meanError / maxGlobalError) * 100);
       if (typeof ns.meanError === 'number') ns.barWidth = Math.min(100, (ns.meanError / maxGlobalError) * 100);
@@ -938,7 +768,6 @@ export default function Dashboard() {
 
     const sourceCandidates = [
       { label: 'Native (Android)', stats: ns },
-      { label: 'Browser', stats: bs },
       { label: 'Traccar', stats: ts },
       { label: 'IoT (ESP32)', stats: is }
     ]
@@ -960,7 +789,6 @@ export default function Dashboard() {
       displayLat: refMode === 'manual' ? refLat : resolvedLat.toFixed(6),
       displayLng: refMode === 'manual' ? refLng : resolvedLng.toFixed(6),
       statusMsg: finalStatus,
-      browserStats: bs,
       traccarStats: ts,
       iotStats: is,
       nativeStats: ns,
@@ -993,14 +821,6 @@ export default function Dashboard() {
   };
 
   // Analysis Handlers
-  const handleSetRefFromGPS = () => {
-    setRefMode('gps');
-    if (!browserGpsActive) {
-      startGPS();
-      setGpsOn(true);
-    }
-  };
-
   const handleRunAnalysis = () => {
     setAnalysisTick(t => t + 1);
   };
@@ -1072,21 +892,17 @@ export default function Dashboard() {
   return (
     <div className="min-h-screen flex flex-col">
       <Header 
-        deviceName={myDevice} 
         theme={theme} 
         lang={lang}
         onToggleTheme={() => setTheme(t => t === 'dark' ? 'light' : 'dark')}
         onToggleLang={() => setLang(l => l === 'th' ? 'en' : 'th')}
-        onChangeDeviceName={handleChangeDeviceName}
         traccarError={traccarError}
-        status={{ supabase: supaStatus, gps: browserGpsActive, traccar: traccarConnected }}
+        status={{ supabase: supaStatus, traccar: traccarConnected }}
       />
       
       <ControlBar 
         isTracking={isTrack}
-        gpsOn={browserGpsActive}
         onToggleTracking={toggleTracking}
-        onToggleBrowserGPS={toggleBrowserGPS}
         onFilterChange={(src, dev) => {
           setFilter({ src, dev });
           loadHistoryPage(1, src, dev);
@@ -1117,7 +933,6 @@ export default function Dashboard() {
       <AnalysisPanel 
         isVisible={isAnalysisOpen}
         onClose={() => setIsAnalysisOpen(false)}
-        onSetRefFromGPS={handleSetRefFromGPS}
         onRunAnalysis={handleRunAnalysis}
         onExportCSV={handleExportCSV}
         onReset={handleResetAnalysis}
@@ -1137,7 +952,6 @@ export default function Dashboard() {
         onRefLatChange={setRefLat}
         onRefLngChange={setRefLng}
         refStatus={autoAnalysis.statusMsg}
-        browserStats={autoAnalysis.browserStats}
         iotStats={autoAnalysis.iotStats}
         traccarStats={autoAnalysis.traccarStats}
         nativeStats={autoAnalysis.nativeStats}

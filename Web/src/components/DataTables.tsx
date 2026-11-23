@@ -279,7 +279,6 @@ export default function DataTables({
         </div>
         <div className="comp-grid mt-4" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))' }}>
           {renderColumn('native', 'Native (Android)', 'ch-native')}
-          {renderColumn('browser', 'Browser (Real-time)', 'ch-browser')}
           {renderColumn('traccar', 'Traccar (Deep Analytics)', 'ch-traccar')}
           {renderColumn('iot', 'IoT ESP32 (Stable)', 'ch-iot')}
         </div>

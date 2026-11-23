@@ -20,7 +20,6 @@ interface MapAreaProps {
   stats: {
     all: number;
     native?: number;
-    browser: number;
     iot: number;
     traccar: number;
   };
@@ -59,11 +58,6 @@ export default function MapArea({ stats, theme, liveData = [], historyData = [],
           <Smartphone size={14} className="text-[#10B981]" />
           <span className="text-xs text-[var(--text-2)]">Native</span>
           <span className="n text-[#10B981]">{stats.native ?? 0}</span>
-        </div>
-        <div className="sc" title="Browser (Real-time)">
-          <Locate size={14} className="text-[#06B6D4]" />
-          <span className="text-xs text-[var(--text-2)]">Browser</span>
-          <span className="n text-[#06B6D4]">{stats.browser}</span>
         </div>
         <div className="sc" title="IoT (ESP32)">
           <Cpu size={14} className="text-[#F97316]" />

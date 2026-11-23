@@ -3,7 +3,7 @@ import { Locate, Activity, Cpu, MapPin, Calculator, FileText, RotateCcw, X, Smar
 import { Radar, RadarChart, PolarGrid, PolarAngleAxis, PolarRadiusAxis, ResponsiveContainer, Legend, Tooltip } from 'recharts';
 import { AnalysisStats, ParsedKmlRoute, RouteComparisonMetrics } from '@/utils/calculations';
 
-export type ReferenceMode = 'centroid' | 'device' | 'gps' | 'manual' | 'kml';
+export type ReferenceMode = 'centroid' | 'device' | 'manual' | 'kml';
 
 export interface DeviceAnalysisRow {
   deviceId: string;
@@ -23,7 +23,6 @@ export interface DeviceAnalysisRow {
 interface AnalysisPanelProps {
   isVisible: boolean;
   onClose: () => void;
-  onSetRefFromGPS: () => void;
   onRunAnalysis: () => void;
   onExportCSV: () => void;
   onReset: () => void;
@@ -37,7 +36,6 @@ interface AnalysisPanelProps {
   onRefLatChange: (val: string) => void;
   onRefLngChange: (val: string) => void;
   refStatus: string;
-  browserStats: AnalysisStats;
   iotStats: AnalysisStats;
   traccarStats: AnalysisStats;
   nativeStats?: AnalysisStats;
@@ -52,7 +50,6 @@ interface AnalysisPanelProps {
 export default function AnalysisPanel({
   isVisible,
   onClose,
-  onSetRefFromGPS,
   onRunAnalysis,
   onExportCSV,
   onReset,
@@ -66,7 +63,6 @@ export default function AnalysisPanel({
   onRefLatChange,
   onRefLngChange,
   refStatus,
-  browserStats,
   iotStats,
   traccarStats,
   nativeStats,
@@ -82,28 +78,24 @@ export default function AnalysisPanel({
   const chartData = [
     {
       metric: 'Mean Error (m)',
-      Browser: typeof browserStats.meanError === 'number' ? browserStats.meanError : 0,
       Traccar: typeof traccarStats.meanError === 'number' ? traccarStats.meanError : 0,
       IoT: typeof iotStats.meanError === 'number' ? iotStats.meanError : 0,
       Native: typeof nativeStats?.meanError === 'number' ? nativeStats.meanError : 0,
     },
     {
       metric: 'Max Error (m)',
-      Browser: typeof browserStats.max === 'number' ? browserStats.max : 0,
       Traccar: typeof traccarStats.max === 'number' ? traccarStats.max : 0,
       IoT: typeof iotStats.max === 'number' ? iotStats.max : 0,
       Native: typeof nativeStats?.max === 'number' ? nativeStats.max : 0,
     },
     {
       metric: 'Std Deviation',
-      Browser: typeof browserStats.stdDev === 'number' ? browserStats.stdDev : 0,
       Traccar: typeof traccarStats.stdDev === 'number' ? traccarStats.stdDev : 0,
       IoT: typeof iotStats.stdDev === 'number' ? iotStats.stdDev : 0,
       Native: typeof nativeStats?.stdDev === 'number' ? nativeStats.stdDev : 0,
     },
     {
       metric: 'Reported Acc (m)',
-      Browser: typeof browserStats.avgAcc === 'number' ? browserStats.avgAcc : 0,
       Traccar: typeof traccarStats.avgAcc === 'number' ? traccarStats.avgAcc : 0,
       IoT: typeof iotStats.avgAcc === 'number' ? iotStats.avgAcc : 0,
       Native: typeof nativeStats?.avgAcc === 'number' ? nativeStats.avgAcc : 0,
@@ -151,13 +143,6 @@ export default function AnalysisPanel({
                 onClick={() => onRefModeChange('device')}
               >
                 เทียบ Device หลัก
-              </button>
-              <button
-                type="button"
-                className={modeBtnClass(refMode === 'gps')}
-                onClick={onSetRefFromGPS}
-              >
-                <span className="inline-flex items-center gap-1"><Locate size={12} /> Live GPS</span>
               </button>
               <button
                 type="button"
@@ -284,7 +269,6 @@ export default function AnalysisPanel({
                     itemStyle={{ fontSize: '12px' }}
                   />
                   <Legend wrapperStyle={{ fontSize: '12px', marginTop: '10px' }} />
-                  <Radar name="Browser" dataKey="Browser" stroke="#06B6D4" fill="#06B6D4" fillOpacity={0.3} />
                   <Radar name="Traccar" dataKey="Traccar" stroke="#8B5CF6" fill="#8B5CF6" fillOpacity={0.3} />
                   <Radar name="IoT" dataKey="IoT" stroke="#F97316" fill="#F97316" fillOpacity={0.3} />
                   <Radar name="Native" dataKey="Native" stroke="#10B981" fill="#10B981" fillOpacity={0.3} />
@@ -329,23 +313,6 @@ export default function AnalysisPanel({
                 </div>
               </div>
             )}
-
-            {/* Browser */}
-            <div className="ana-card ac-browser">
-              <div className="ana-card-title text-[#06B6D4]"><Locate size={16} /> Browser</div>
-              <div className="stat-grid">
-                <div className="stat-item"><div className="stat-label">Samples</div><div className="stat-value">{browserStats.samples}</div></div>
-                <div className="stat-item"><div className="stat-label">Mean Error</div><div className="stat-value text-[#06B6D4]">{browserStats.meanError} m</div></div>
-                <div className="stat-item"><div className="stat-label">Std Dev</div><div className="stat-value">{browserStats.stdDev} m</div></div>
-                <div className="stat-item"><div className="stat-label">Max</div><div className="stat-value">{browserStats.max} m</div></div>
-              </div>
-              <div className="mt-4">
-                <div className="text-[10px] text-[var(--text-3)] mb-1 uppercase tracking-wider">Error Ratio</div>
-                <div className="h-2 bg-[var(--bg-card-hover)] rounded-full overflow-hidden">
-                  <div className="h-full bg-[#06B6D4] rounded-full transition-all duration-500" style={{ width: `${browserStats.barWidth}%` }}></div>
-                </div>
-              </div>
-            </div>
 
             {/* Traccar */}
             <div className="ana-card ac-traccar">
