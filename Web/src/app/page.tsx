@@ -886,17 +886,36 @@ export default function Dashboard() {
   const handleExportCSV = async () => {
     let exportRows: any[] = [];
     if (supabase) {
-      const chunkSize = 1000;
-      for (let offset = 0; offset < MAX_CSV_EXPORT_ROWS; offset += chunkSize) {
-        let query = supabase.from('gps_history').select('*');
-        if (filter.src !== 'all') query = query.eq('source', filter.src);
-        if (filter.dev !== 'all') query = query.eq('device_id', filter.dev);
-        const { data, error } = await query
-          .order('server_time', { ascending: false, nullsFirst: false })
-          .range(offset, offset + chunkSize - 1);
-        if (error || !Array.isArray(data) || data.length === 0) break;
-        exportRows.push(...data);
-        if (data.length < chunkSize) break;
+      const fetchBySource = async (src: string, maxRows: number) => {
+        const rows: any[] = [];
+        const chunkSize = 1000;
+        for (let offset = 0; offset < maxRows; offset += chunkSize) {
+          let query = supabase.from('gps_history').select('*').eq('source', src);
+          if (filter.dev !== 'all') query = query.eq('device_id', filter.dev);
+          const { data, error } = await query
+            .order('server_time', { ascending: false, nullsFirst: false })
+            .range(offset, offset + chunkSize - 1);
+          if (error || !Array.isArray(data) || data.length === 0) break;
+          rows.push(...data);
+          if (data.length < chunkSize) break;
+        }
+        return rows;
+      };
+
+      if (filter.src !== 'all') {
+        exportRows = await fetchBySource(filter.src, MAX_CSV_EXPORT_ROWS);
+      } else {
+        // Fetch each source in parallel so high-frequency 5Hz IoT never crowds out Native or Traccar
+        const [nativeRows, traccarRows, iotRows] = await Promise.all([
+          fetchBySource('native', 30000),
+          fetchBySource('traccar', 30000),
+          fetchBySource('iot', 40000),
+        ]);
+        exportRows = [...nativeRows, ...traccarRows, ...iotRows].sort((a, b) => {
+          const ta = new Date(a.device_time || a.server_time || 0).getTime();
+          const tb = new Date(b.device_time || b.server_time || 0).getTime();
+          return tb - ta;
+        });
       }
     }
     if (exportRows.length === 0) exportRows = filteredHist;
