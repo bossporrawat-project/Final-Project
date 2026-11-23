@@ -1,8 +1,8 @@
 'use client';
 
-import React from 'react';
+import React, { useState } from 'react';
 import dynamic from 'next/dynamic';
-import { Locate, Activity, Cpu, Smartphone } from 'lucide-react';
+import { Locate, Activity, Cpu, Smartphone, GitMerge } from 'lucide-react';
 
 const MapComponent = dynamic(() => import('./MapComponent'), {
   ssr: false,
@@ -32,13 +32,22 @@ interface MapAreaProps {
 }
 
 export default function MapArea({ stats, theme, liveData = [], historyData = [], clearSignal = 0, kmlRoute }: MapAreaProps) {
+  const [showMeanRoute, setShowMeanRoute] = useState(false);
+
   return (
     <div
       id="map-c"
       className="relative h-[50vh] min-h-[360px] border-b border-[var(--border)]"
       style={{ position: 'relative', height: '50vh', minHeight: '380px', width: '100%' }}
     >
-      <MapComponent theme={theme} liveData={liveData} historyData={historyData} clearSignal={clearSignal} kmlRoute={kmlRoute} />
+      <MapComponent
+        theme={theme}
+        liveData={liveData}
+        historyData={historyData}
+        clearSignal={clearSignal}
+        kmlRoute={kmlRoute}
+        showMeanRoute={showMeanRoute}
+      />
       
       <div className="mst">
         <div className="sc" title="Total Active Devices">
@@ -66,6 +75,32 @@ export default function MapArea({ stats, theme, liveData = [], historyData = [],
           <span className="text-xs text-[var(--text-2)]">Traccar</span>
           <span className="n text-[#8B5CF6]">{stats.traccar}</span>
         </div>
+        <button
+          type="button"
+          onClick={() => setShowMeanRoute((v) => !v)}
+          disabled={stats.all < 2 && !showMeanRoute}
+          title={stats.all < 2 ? 'ต้องมีอย่างน้อย 2 อุปกรณ์เพื่อคำนวณเส้นค่ากลาง' : 'แสดง/ซ่อนเส้นค่ากลางเฉลี่ยจากทุกอุปกรณ์บนแผนที่'}
+          className="sc cursor-pointer transition-colors hover:border-[#EC4899]/70 disabled:opacity-50 disabled:cursor-not-allowed"
+          style={
+            showMeanRoute
+              ? { borderColor: '#EC4899', backgroundColor: 'rgba(236, 72, 153, 0.16)' }
+              : undefined
+          }
+        >
+          <GitMerge size={14} className="text-[#EC4899]" />
+          <span className="text-xs" style={showMeanRoute ? { color: '#EC4899', fontWeight: 700 } : undefined}>
+            เส้นค่ากลาง
+          </span>
+          <span
+            className="n text-[11px] px-1.5 py-0.5 rounded"
+            style={{
+              backgroundColor: showMeanRoute ? '#EC4899' : 'var(--bg-secondary)',
+              color: showMeanRoute ? '#FFFFFF' : 'var(--text-3)',
+            }}
+          >
+            {showMeanRoute ? 'ON' : 'OFF'}
+          </span>
+        </button>
       </div>
     </div>
   );

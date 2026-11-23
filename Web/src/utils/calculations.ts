@@ -454,6 +454,146 @@ export function computeKmlBaselineMetrics(route: ParsedKmlRoute): RouteCompariso
   };
 }
 
+export interface MeanRouteResult {
+  points: Array<{ lat: number; lng: number }>;
+  deviceCount: number;
+  method: 'time-bucket' | 'arc-length' | 'centroid' | 'none';
+}
+
+function resampleRouteByArcLength(
+  pts: Array<{ lat: number; lng: number }>,
+  sampleCount: number
+): Array<{ lat: number; lng: number }> {
+  if (pts.length === 0) return [];
+  if (pts.length === 1 || sampleCount <= 1) return [{ lat: pts[0].lat, lng: pts[0].lng }];
+
+  const cumDist: number[] = [0];
+  for (let i = 1; i < pts.length; i++) {
+    cumDist.push(cumDist[i - 1] + haversine(pts[i - 1].lat, pts[i - 1].lng, pts[i].lat, pts[i].lng));
+  }
+  const totalLen = cumDist[cumDist.length - 1];
+  if (totalLen === 0) {
+    return Array.from({ length: sampleCount }, () => ({ lat: pts[0].lat, lng: pts[0].lng }));
+  }
+
+  const out: Array<{ lat: number; lng: number }> = [];
+  let seg = 1;
+  for (let i = 0; i < sampleCount; i++) {
+    const target = (i / (sampleCount - 1)) * totalLen;
+    while (seg < cumDist.length - 1 && cumDist[seg] < target) {
+      seg++;
+    }
+    const prevD = cumDist[seg - 1];
+    const nextD = cumDist[seg];
+    const ratio = nextD > prevD ? (target - prevD) / (nextD - prevD) : 0;
+    const p0 = pts[seg - 1];
+    const p1 = pts[seg];
+    out.push({
+      lat: p0.lat + ratio * (p1.lat - p0.lat),
+      lng: p0.lng + ratio * (p1.lng - p0.lng),
+    });
+  }
+  return out;
+}
+
+/**
+ * Computes a multi-device consensus Mean Route across all provided device routes.
+ * Prefers 5-second time-aligned averaging (equal weight per device regardless of Hz),
+ * falling back to arc-length progress resampling if devices ran in non-overlapping windows.
+ */
+export function computeConsensusMeanRoute(
+  routesByDevice: Record<string, Array<{ lat: number; lng: number; timeMs?: number }>>
+): MeanRouteResult {
+  const deviceIds = Object.keys(routesByDevice).filter((id) => routesByDevice[id].length > 0);
+  if (deviceIds.length < 2) {
+    return { points: [], deviceCount: deviceIds.length, method: 'none' };
+  }
+
+  // 1. Time-bucket averaging (5s buckets) when devices overlap in real time
+  const buckets = new Map<number, Map<string, { sumLat: number; sumLng: number; count: number }>>();
+  for (const devId of deviceIds) {
+    for (const p of routesByDevice[devId]) {
+      if (!p.timeMs || p.timeMs <= 0) continue;
+      const bKey = Math.round(p.timeMs / 5000) * 5000;
+      let devMap = buckets.get(bKey);
+      if (!devMap) {
+        devMap = new Map();
+        buckets.set(bKey, devMap);
+      }
+      const acc = devMap.get(devId) || { sumLat: 0, sumLng: 0, count: 0 };
+      acc.sumLat += p.lat;
+      acc.sumLng += p.lng;
+      acc.count += 1;
+      devMap.set(devId, acc);
+    }
+  }
+
+  const timeAlignedPoints = Array.from(buckets.entries())
+    .filter(([, devMap]) => devMap.size >= 2)
+    .sort((a, b) => a[0] - b[0])
+    .map(([, devMap]) => {
+      let sumLat = 0;
+      let sumLng = 0;
+      devMap.forEach((v) => {
+        sumLat += v.sumLat / v.count;
+        sumLng += v.sumLng / v.count;
+      });
+      return {
+        lat: sumLat / devMap.size,
+        lng: sumLng / devMap.size,
+      };
+    });
+
+  if (timeAlignedPoints.length >= 3) {
+    return {
+      points: timeAlignedPoints,
+      deviceCount: deviceIds.length,
+      method: 'time-bucket',
+    };
+  }
+
+  // 2. Fallback: resample multi-point routes along normalized arc-length progress [0..1]
+  const multiPointIds = deviceIds.filter((id) => routesByDevice[id].length >= 2);
+  if (multiPointIds.length >= 2) {
+    const sampleN = 80;
+    const resampled = multiPointIds.map((id) => resampleRouteByArcLength(routesByDevice[id], sampleN));
+    const avgRoute: Array<{ lat: number; lng: number }> = [];
+    for (let i = 0; i < sampleN; i++) {
+      let sumLat = 0;
+      let sumLng = 0;
+      for (let d = 0; d < resampled.length; d++) {
+        sumLat += resampled[d][i].lat;
+        sumLng += resampled[d][i].lng;
+      }
+      avgRoute.push({
+        lat: sumLat / resampled.length,
+        lng: sumLng / resampled.length,
+      });
+    }
+    return {
+      points: avgRoute,
+      deviceCount: multiPointIds.length,
+      method: 'arc-length',
+    };
+  }
+
+  // 3. Stationary fallback: mean centroid across per-device centers
+  let sumLat = 0;
+  let sumLng = 0;
+  for (const id of deviceIds) {
+    const pts = routesByDevice[id];
+    const devLat = pts.reduce((s, p) => s + p.lat, 0) / pts.length;
+    const devLng = pts.reduce((s, p) => s + p.lng, 0) / pts.length;
+    sumLat += devLat;
+    sumLng += devLng;
+  }
+  return {
+    points: [{ lat: sumLat / deviceIds.length, lng: sumLng / deviceIds.length }],
+    deviceCount: deviceIds.length,
+    method: 'centroid',
+  };
+}
+
 /**
  * Uniformly decimates an ordered array of points to at most maxPoints while
  * always preserving the first and last point (so start, end, and route shape stay intact).

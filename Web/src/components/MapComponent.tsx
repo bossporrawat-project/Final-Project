@@ -3,7 +3,7 @@
 import React, { useEffect, useRef } from 'react';
 import 'leaflet/dist/leaflet.css';
 import L from 'leaflet';
-import { haversine, calculateBearing, formatDirectionTH, decimatePoints } from '@/utils/calculations';
+import { haversine, calculateBearing, formatDirectionTH, decimatePoints, computeConsensusMeanRoute } from '@/utils/calculations';
 
 interface MapComponentProps {
   theme: 'dark' | 'light';
@@ -11,6 +11,7 @@ interface MapComponentProps {
   historyData?: any[];
   clearSignal?: number;
   kmlRoute?: { lat: number; lng: number }[];
+  showMeanRoute?: boolean;
 }
 
 function isValidPos(pos: any): boolean {
@@ -73,7 +74,7 @@ function buildArrowSvg(bearing: number | null, size: number = 11) {
   `;
 }
 
-export default function MapComponent({ theme, liveData = [], historyData = [], clearSignal = 0, kmlRoute }: MapComponentProps) {
+export default function MapComponent({ theme, liveData = [], historyData = [], clearSignal = 0, kmlRoute, showMeanRoute = false }: MapComponentProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<L.Map | null>(null);
   const tileLayerRef = useRef<L.TileLayer | null>(null);
@@ -81,6 +82,7 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
   const linesGroupRef = useRef<L.LayerGroup | null>(null);
   const dotsGroupRef = useRef<L.LayerGroup | null>(null);
   const kmlGroupRef = useRef<L.LayerGroup | null>(null);
+  const meanGroupRef = useRef<L.LayerGroup | null>(null);
 
   // Persistent layer registries so open popups are never destroyed on live data updates
   // and old points are NEVER deleted until Clear is clicked
@@ -137,6 +139,7 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
     dotsGroupRef.current = L.layerGroup().addTo(map);
     markersGroupRef.current = L.layerGroup().addTo(map);
     kmlGroupRef.current = L.layerGroup().addTo(map);
+    meanGroupRef.current = L.layerGroup().addTo(map);
     mapRef.current = map;
 
     const timer = setTimeout(() => {
@@ -162,6 +165,7 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
       dotsGroupRef.current = null;
       markersGroupRef.current = null;
       kmlGroupRef.current = null;
+      meanGroupRef.current = null;
       try {
         map.remove();
       } catch {}
@@ -197,6 +201,7 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
     linesGroupRef.current?.clearLayers();
     dotsGroupRef.current?.clearLayers();
     markersGroupRef.current?.clearLayers();
+    meanGroupRef.current?.clearLayers();
   }, [clearSignal]);
 
   // Draw KML Ground-Truth reference route whenever uploaded/cleared
@@ -580,7 +585,111 @@ export default function MapComponent({ theme, liveData = [], historyData = [], c
       mapRef.current.fitBounds(bounds, { padding: [55, 55], maxZoom: 16 });
       hasFittedBounds.current = true;
     }
-  }, [liveData, historyData, theme]);
+
+    // 4. Draw or clear Multi-Device Consensus Mean Route (เส้นค่ากลาง)
+    const meanGroup = meanGroupRef.current;
+    if (meanGroup) {
+      meanGroup.clearLayers();
+      if (showMeanRoute) {
+        const activeIds = new Set([
+          ...liveData.filter(isValidPos).map((p) => String(p.device_id)),
+          ...historyData.filter(isValidPos).map((p) => String(p.device_id)),
+        ]);
+        const routesByDev: Record<string, Array<{ lat: number; lng: number; timeMs?: number }>> = {};
+        Object.keys(accumulatedByDeviceRef.current).forEach((devId) => {
+          if (activeIds.size > 0 && !activeIds.has(devId)) return;
+          const pts = Array.from(accumulatedByDeviceRef.current[devId].values())
+            .filter(isValidPos)
+            .map((p) => {
+              const rawT = p.device_time || p.recorded_at || p.updated_at || p.timestamp;
+              const tMs = rawT ? Date.parse(String(rawT)) : NaN;
+              return {
+                lat: p.latitude,
+                lng: p.longitude,
+                timeMs: !isNaN(tMs) ? tMs : undefined,
+              };
+            })
+            .sort((a, b) => (a.timeMs || 0) - (b.timeMs || 0));
+          if (pts.length > 0) routesByDev[devId] = pts;
+        });
+
+        const consensus = computeConsensusMeanRoute(routesByDev);
+        if (consensus.points.length >= 2) {
+          const sampled = decimatePoints(consensus.points, 600);
+          const rawCoords = sampled.map((p) => [p.lat, p.lng] as [number, number]);
+          const smoothMean = smoothCoordinates(rawCoords);
+
+          let meanDistM = 0;
+          for (let i = 1; i < consensus.points.length; i++) {
+            meanDistM += haversine(
+              consensus.points[i - 1].lat,
+              consensus.points[i - 1].lng,
+              consensus.points[i].lat,
+              consensus.points[i].lng
+            );
+          }
+          const meanDistLabel =
+            meanDistM >= 1000 ? `${(meanDistM / 1000).toFixed(2)} km` : `${Math.round(meanDistM)} m`;
+          const methodLabel =
+            consensus.method === 'time-bucket' ? 'เฉลี่ยร่วมตามช่วงเวลา (5s)' : 'เฉลี่ยตามสัดส่วนระยะเส้นทาง';
+
+          const meanPopup = `
+            <div class="pp-t" style="color: #EC4899; border-bottom: 1px solid #EC489940; padding-bottom: 4px; margin-bottom: 6px;">
+              🧭 เส้นค่ากลาง (Mean Route)
+            </div>
+            <div class="pp-r"><span class="l">รวมอุปกรณ์:</span><span class="v" style="color: #EC4899; font-weight: 700;">${consensus.deviceCount} เครื่อง</span></div>
+            <div class="pp-r"><span class="l">วิธีคำนวณ:</span><span class="v">${methodLabel}</span></div>
+            <div class="pp-r"><span class="l">ระยะทางเส้นกลาง:</span><span class="v">${meanDistLabel}</span></div>
+            <div class="pp-r"><span class="l">จำนวนจุด:</span><span class="v">${consensus.points.length} จุด</span></div>
+          `;
+
+          L.polyline(smoothMean, {
+            color: theme === 'dark' ? '#090D16' : '#FFFFFF',
+            weight: 8,
+            opacity: 0.85,
+            lineCap: 'round',
+            lineJoin: 'round',
+          }).addTo(meanGroup);
+
+          L.polyline(smoothMean, {
+            color: '#EC4899',
+            weight: 4.5,
+            opacity: 0.98,
+            lineCap: 'round',
+            lineJoin: 'round',
+          })
+            .bindPopup(meanPopup, { autoClose: false, closeOnClick: false })
+            .bindTooltip(`เส้นค่ากลาง (${consensus.deviceCount} เครื่อง)`, { sticky: true })
+            .addTo(meanGroup);
+
+          L.polyline(smoothMean, {
+            color: '#FFFFFF',
+            weight: 1.6,
+            opacity: 0.9,
+            dashArray: '5, 9',
+            lineCap: 'round',
+            lineJoin: 'round',
+          })
+            .bindPopup(meanPopup, { autoClose: false, closeOnClick: false })
+            .addTo(meanGroup);
+        } else if (consensus.points.length === 1) {
+          const c = consensus.points[0];
+          L.circleMarker([c.lat, c.lng], {
+            radius: 9,
+            color: '#FFFFFF',
+            weight: 2,
+            fillColor: '#EC4899',
+            fillOpacity: 0.95,
+          })
+            .bindPopup(
+              `<div class="pp-t" style="color:#EC4899">🧭 จุดค่ากลาง (${consensus.deviceCount} เครื่อง)</div><div class="pp-r"><span class="l">Lat/Lng:</span><span class="v">${c.lat.toFixed(6)}, ${c.lng.toFixed(6)}</span></div>`
+            )
+            .bindTooltip(`จุดค่ากลาง (${consensus.deviceCount} เครื่อง)`, { permanent: true, direction: 'top' })
+            .addTo(meanGroup);
+        }
+      }
+    }
+  }, [liveData, historyData, theme, showMeanRoute]);
 
   return (
     <div
