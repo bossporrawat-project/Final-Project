@@ -2,20 +2,17 @@
  * ============================================================================
  * 🛰️ Tracker by boss — ESP32 + GPS (5Hz UBX) + MH-SD Card Module
  * ============================================================================
- * รวมโค้ด GPS Module + Firebase เดิมของคุณบอส เข้ากับระบบ SD Card & Supabase:
- * 1. GPS (UART1: RX=16, TX=17, Baud 9600) + คำสั่ง UBX ตั้งค่า Refresh Rate 5Hz
+ * GPS Module + SD Card + Supabase (ไม่มี Firebase แล้ว):
+ * 1. GPS (UART1: RX=16, TX=17, Baud 9600 -> 115200 อัตโนมัติ) + คำสั่ง UBX ตั้งค่า 5Hz
  * 2. MH-SD Card Module (VSPI: CS=5, SCK=18, MISO=19, MOSI=23)
- *    - บันทึกลงไฟล์ /gps_log.csv ทุก 1 วินาที พร้อมวันที่และเวลาไทย (UTC+7)
+ *    - บันทึก CSV แยกไฟล์ตามวัน (/gps_YYYY-MM-DD.csv) เวลาไทย (UTC+7)
  *    - ระบบ Offline Queue (/offline_queue.jsonl): หาก Wi-Fi หลุดหรืออยู่ข้างนอก
  *      จะเก็บคิวลง SD Card และทยอยซิงก์เข้า Supabase ให้อัตโนมัติเมื่อต่อ Wi-Fi ได้
- * 3. รองรับส่งขึ้นทั้ง Supabase (gps_history -> Trigger อัปเดต gps_positions)
- *    และ Firebase RTDB (/gps_data/001 และ /gps_log/001) ตามโค้ดเดิมของคุณบอส
+ * 3. ส่งขึ้น Supabase (gps_history -> Trigger อัปเดต gps_positions)
  *
  * ⚙️ ตั้งค่า Arduino IDE ก่อน Compile:
- * - Tools -> Partition Scheme -> "Huge APP (3MB No OTA/1MB SPIFFS)"
- *   (หากเปิดใช้งาน Firebase ร่วมกับ Supabase เพื่อไม่ให้พื้นที่ Flash เต็ม)
- * - หากต้องการใช้เฉพาะ Supabase + SD Card (ประหยัดพื้นที่ & เร็วขึ้น)
- *   ให้เปลี่ยน #define ENABLE_FIREBASE_SYNC 1 เป็น 0
+ * - Board: ESP32 Dev Module
+ * - Library ที่ต้องใช้: TinyGPSPlus (ไม่ต้องติดตั้ง Firebase library แล้ว)
  * ============================================================================
  */
 
@@ -30,9 +27,6 @@
 #include <Preferences.h>
 #include <time.h>
 
-// ตั้งเป็น 0 = ปิด Firebase ส่งตรงเข้า Supabase + SD Card เท่านั้น (Compile & Upload เร็วขึ้นมาก)
-#define ENABLE_FIREBASE_SYNC 0
-
 // เว็บลับในตัว ESP32 สำหรับอ่าน/ดาวน์โหลดไฟล์ทั้งหมดใน SD Card (แยกจากเว็บหลัก Next.js โดยสิ้นเชิง)
 #define SD_WEB_ENABLE      1
 #define SD_WEB_PORT        80
@@ -46,12 +40,6 @@
 
 #if SD_WEB_ENABLE
   #include <WebServer.h>
-#endif
-
-#if ENABLE_FIREBASE_SYNC
-  #include <Firebase_ESP_Client.h>
-  #include "addons/TokenHelper.h"
-  #include "addons/RTDBHelper.h"
 #endif
 
 // ==================== 1. ตั้งค่า Wi-Fi และ Device ====================
@@ -69,24 +57,12 @@ const int WIFI_LIST_COUNT = sizeof(WIFI_LIST) / sizeof(WIFI_LIST[0]);
 int activeWifiIdx = 0;
 
 const char* SUPABASE_DEVICE_ID = "IOT_ESP32_001"; // ชื่อใน Supabase / หน้าเว็บ Dashboard
-const char* FIREBASE_DEVICE_ID = "001";       // ชื่อ Node ใน Firebase (/gps_data/001)
 
 // ==================== 2. ตั้งค่า Supabase ====================
 const char* SUPABASE_URL = "https://ryuhkaytmlapkuumgnlo.supabase.co";
 const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ5dWhrYXl0bWxhcGt1dW1nbmxvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE1MzY4MjUsImV4cCI6MjEwNzExMjgyNX0.JYKrvAMK64xE5r92pepQy02fVl4mO55dMaz93heaee8";
 
-// ==================== 3. ตั้งค่า Firebase (ตามโค้ดเดิม) ====================
-#if ENABLE_FIREBASE_SYNC
-  #define API_KEY      "AIzaSyBNb02ytrtRG9bhEj0Zaw8UvwxYgp0oehw"
-  #define DATABASE_URL "https://iot-project-c13c9-default-rtdb.asia-southeast1.firebasedatabase.app/"
-
-  FirebaseData fbdo;
-  FirebaseAuth auth;
-  FirebaseConfig config;
-  bool firebaseInitialized = false;
-#endif
-
-// ==================== 4. ตั้งค่าขา Pin ====================
+// ==================== 3. ตั้งค่าขา Pin ====================
 // GPS Module (UART1 ตามโค้ดเดิมของคุณบอส — อัปเป็น 115200 bps อัตโนมัติเพื่อรองรับ 5Hz)
 #define GPS_RX_PIN    16
 #define GPS_TX_PIN    17
@@ -99,7 +75,7 @@ const char* SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXB
 #define SD_MISO_PIN 19
 #define SD_MOSI_PIN 23
 
-// ==================== 5. ความถี่การส่งข้อมูล (โหมด 5Hz สำหรับรถ EV) ====================
+// ==================== 4. ความถี่การส่งข้อมูล (โหมด 5Hz สำหรับรถ EV) ====================
 const unsigned long LOG_INTERVAL_MS   = 200;   // 200 ms = 5 Hz (5 จุด/วินาที ลง SD Card + Buffer)
 const unsigned long CLOUD_BATCH_MS    = 1000;  // รวบส่ง Batch ขึ้น Supabase ทุก 1 วินาที (ครั้งละ ~5 จุด)
 const unsigned long QUEUE_SYNC_MS     = 10000; // ตรวจคิวค้างใน SD Card ทุก 10 วินาที
@@ -113,6 +89,7 @@ TinyGPSCustom glGsvInView;
 Preferences prefs;
 
 bool sdReady = false;
+bool offlineQueuePending = false; // มีคิวค้างบน SD หรือไม่ (เก็บใน RAM ไม่ต้องถามการ์ดทุกรอบ loop)
 bool m8nTimeAssisted = false;
 bool ev5HzActivated = false;
 bool ntpConfigured = false;
@@ -138,8 +115,10 @@ int sdCsvBufferedCount = 0;
 
 const char* CSV_LOG_FILE   = "/gps_log.csv";
 const char* QUEUE_FILE     = "/offline_queue.jsonl";
-const char* QUEUE_TMP_FILE = "/offline_queue_tmp.jsonl";
 const char* QUEUE_BAD_FILE = "/offline_bad.jsonl";
+const char* QUEUE_POS_FILE = "/offline_queue.pos";
+const int   QUEUE_LINES_PER_ROUND = 10;     // ส่งคิวค้างได้สูงสุด 10 batch ต่อรอบ
+const unsigned long QUEUE_SYNC_FAST_MS = 2000; // ถ้ายังมีคิวค้าง ให้วนส่งถี่ขึ้น (ทุก 2 วิ)
 
 struct DeviceDateTime {
   String dateTH;   // YYYY-MM-DD (UTC+7)
@@ -473,16 +452,24 @@ void initSDCard() {
     return;
   }
   Serial.println("✅ [SD Card] เชื่อมต่อสำเร็จ (SPI Stable Mode)!");
+  Serial.printf("   ประเภท: %s | ขนาดการ์ด: %llu MB | ใช้ไป: %llu MB\n",
+                SD.cardType() == CARD_SDHC ? "SDHC/SDXC" : (SD.cardType() == CARD_SD ? "SDSC" : "MMC/อื่นๆ"),
+                SD.cardSize() / (1024ULL * 1024ULL), SD.usedBytes() / (1024ULL * 1024ULL));
+  offlineQueuePending = SD.exists(QUEUE_FILE);
+  if (offlineQueuePending) {
+    Serial.println("📦 [Offline Queue] พบคิวค้างจากรอบก่อน จะทยอยส่งเมื่อเชื่อม Wi-Fi ได้");
+  }
 }
 
 bool writeSdCsvChunk(const String& path, const String& payload) {
-  if (!ensureCsvHeader(path)) return false;
+  if (!ensureCsvHeader(path)) { sdReady = false; return false; }
   File file = SD.open(path, FILE_APPEND);
-  if (!file) return false;
+  if (!file) { sdReady = false; return false; }
   size_t w = file.print(payload);
   file.flush();
   file.close();
-  return w == payload.length();
+  if (w != payload.length()) { sdReady = false; return false; }
+  return true;
 }
 
 void flushSDCsvBuffer() {
@@ -546,14 +533,16 @@ void appendCSVLog(const DeviceDateTime& dt, double lat, double lng, double speed
 void enqueueOfflinePayload(const String& jsonPayload) {
   if (!sdReady && !recoverSDCard()) return;
   File file = SD.open(QUEUE_FILE, FILE_APPEND);
-  if (!file && recoverSDCard()) {
-    file = SD.open(QUEUE_FILE, FILE_APPEND);
+  if (!file) {
+    sdReady = false;
+    if (recoverSDCard()) file = SD.open(QUEUE_FILE, FILE_APPEND);
   }
   if (file) {
     size_t w = file.println(jsonPayload);
     file.flush();
     file.close();
     if (w > 0) {
+      offlineQueuePending = true;
       Serial.println("📦 [Offline Queue] พักข้อมูลลง SD Card รอส่งย้อนหลัง");
       return;
     }
@@ -628,175 +617,127 @@ bool sendToSupabase(const String& jsonPayload) {
   return code >= 200 && code < 300;
 }
 
+// ----------------------------------------------------------------------------
+// Offline Queue แบบ "อ่านต่อจากตำแหน่งเดิม" (Read Offset)
+// - ไม่ copy/rewrite ไฟล์คิวทั้งก้อนทุกรอบอีกแล้ว (เดิมคิวใหญ่ = เขียนการ์ดซ้ำหลาย MB ทุก 10 วิ)
+// - เก็บตำแหน่งที่ส่งถึงแล้วไว้ใน /offline_queue.pos (ไฟล์เล็ก ไม่กี่ไบต์)
+// - ส่งตามลำดับเวลา: ถ้าบรรทัดไหนติดปัญหาเน็ต จะหยุดรอบนั้นแล้วลองบรรทัดเดิมใหม่รอบหน้า
+// - เมื่อส่งครบทั้งไฟล์ จะลบไฟล์คิว + ไฟล์ตำแหน่งทิ้ง
+// ----------------------------------------------------------------------------
+static size_t readQueueOffset() {
+  if (!SD.exists(QUEUE_POS_FILE)) return 0;
+  File p = SD.open(QUEUE_POS_FILE, FILE_READ);
+  if (!p) return 0;
+  String s = p.readStringUntil('\n');
+  p.close();
+  s.trim();
+  long v = s.toInt();
+  return v > 0 ? (size_t)v : 0;
+}
+
+static void writeQueueOffset(size_t offset) {
+  File p = SD.open(QUEUE_POS_FILE, FILE_WRITE); // FILE_WRITE = เขียนทับไฟล์ใหม่
+  if (!p) return;
+  p.println((unsigned long)offset);
+  p.close();
+}
+
+static void clearOfflineQueueFiles() {
+  SD.remove(QUEUE_FILE);
+  SD.remove(QUEUE_POS_FILE);
+  offlineQueuePending = false;
+}
+
 void flushOfflineQueue() {
   if ((!sdReady && !recoverSDCard()) || WiFi.status() != WL_CONNECTED) return;
-  if (!SD.exists(QUEUE_FILE)) return;
+  if (!SD.exists(QUEUE_FILE)) {
+    if (SD.exists(QUEUE_POS_FILE)) SD.remove(QUEUE_POS_FILE);
+    offlineQueuePending = false;
+    return;
+  }
+  offlineQueuePending = true;
 
   File qFile = SD.open(QUEUE_FILE, FILE_READ);
   if (!qFile) {
+    sdReady = false;
     recoverSDCard();
     return;
   }
 
-  if (qFile.size() == 0) {
+  size_t fileSize = qFile.size();
+  size_t offset = readQueueOffset();
+  if (fileSize == 0 || offset >= fileSize) {
     qFile.close();
-    SD.remove(QUEUE_FILE);
+    clearOfflineQueueFiles();
     return;
   }
 
-  // อ่านแค่ 5 บรรทัดแรกแล้วปิดไฟล์ทันที ก่อนยิง HTTPS (ไม่เปิดไฟล์ SD ค้างไว้ระหว่าง Wi-Fi TX)
-  String batchLines[5];
-  int batchCodes[5] = {0, 0, 0, 0, 0};
+  // อ่านทีละไม่เกิน QUEUE_LINES_PER_ROUND บรรทัด แล้วปิดไฟล์ก่อนยิง HTTPS (ไม่เปิดไฟล์ค้างระหว่าง Wi-Fi TX)
+  String batchLines[QUEUE_LINES_PER_ROUND];
+  size_t lineEndOffsets[QUEUE_LINES_PER_ROUND];
   int batchCount = 0;
-  size_t resumeOffset = 0;
-
-  while (qFile.available() && batchCount < 5) {
+  qFile.seek(offset, SeekSet);
+  while (qFile.available() && batchCount < QUEUE_LINES_PER_ROUND) {
     String line = qFile.readStringUntil('\n');
+    size_t endPos = qFile.position();
     line.trim();
-    if (line.length() > 0) {
-      batchLines[batchCount++] = line;
+    if (line.length() == 0) {
+      offset = endPos; // ข้ามบรรทัดว่าง
+      continue;
     }
+    batchLines[batchCount] = line;
+    lineEndOffsets[batchCount] = endPos;
+    batchCount++;
   }
-  resumeOffset = qFile.position();
-  bool hasTail = qFile.available();
   qFile.close();
 
   if (batchCount == 0) {
-    SD.remove(QUEUE_FILE);
+    if (offset >= fileSize) clearOfflineQueueFiles();
+    else writeQueueOffset(offset);
     return;
   }
 
-  Serial.println("🔄 [Offline Queue] พบข้อมูลค้างใน SD Card กำลังทยอยส่งขึ้น Supabase...");
+  Serial.printf("🔄 [Offline Queue] พบข้อมูลค้างใน SD Card (%lu/%lu bytes) กำลังทยอยส่งขึ้น Supabase...\n",
+                (unsigned long)offset, (unsigned long)fileSize);
   int sentCount = 0;
   int badCount = 0;
-  int retryCount = 0;
+  size_t newOffset = offset;
 
   for (int i = 0; i < batchCount; i++) {
     while (GPS.available() > 0) gps.encode(GPS.read());
     pumpSdWebClient();
 
     int code = sendToSupabaseStatus(batchLines[i]);
-    batchCodes[i] = code;
     if (code >= 200 && code < 300) {
       sentCount++;
+      newOffset = lineEndOffsets[i];
     } else if (code >= 400 && code < 500 && code != 408 && code != 429) {
-      badCount++;
-    } else {
-      retryCount++;
-    }
-  }
-
-  // ถ้าส่งไม่สำเร็จเพราะเน็ต (ไม่มีอะไรเปลี่ยนและยังต้องเก็บทุกบรรทัด) ไม่ต้องเขียน/ลบไฟล์ซ้ำให้การ์ดสึกหรอ
-  if (sentCount == 0 && badCount == 0) {
-    return;
-  }
-
-  if (badCount > 0) {
-    File badFile = SD.open(QUEUE_BAD_FILE, FILE_APPEND);
-    if (badFile) {
-      for (int i = 0; i < batchCount; i++) {
-        int c = batchCodes[i];
-        if (c >= 400 && c < 500 && c != 408 && c != 429) {
-          badFile.println(batchLines[i]);
-        }
+      // ข้อมูลเสียถาวร (เช่น JSON ผิดรูป) -> ย้ายไปเก็บไว้ดูทีหลัง แล้วข้ามไป
+      File badFile = SD.open(QUEUE_BAD_FILE, FILE_APPEND);
+      if (badFile) {
+        badFile.println(batchLines[i]);
+        badFile.close();
       }
-      badFile.close();
+      badCount++;
+      newOffset = lineEndOffsets[i];
+    } else {
+      // เน็ต/เซิร์ฟเวอร์มีปัญหาชั่วคราว -> หยุดรอบนี้ไว้ก่อน รักษาลำดับเวลา
+      break;
     }
   }
 
-  if (retryCount == 0 && !hasTail) {
-    SD.remove(QUEUE_FILE);
+  if (newOffset == offset) return; // ไม่มีอะไรคืบหน้า ไม่ต้องเขียนการ์ด
+
+  if (newOffset >= fileSize) {
+    clearOfflineQueueFiles();
     Serial.printf("🎉 [Offline Queue] เคลียร์คิวบน SD Card เรียบร้อย (สำเร็จ %d, คิวเสีย %d)\n",
                   sentCount, badCount);
-    return;
-  }
-
-  File tmpFile = SD.open(QUEUE_TMP_FILE, FILE_WRITE);
-  if (!tmpFile) {
-    recoverSDCard();
-    return;
-  }
-
-  for (int i = 0; i < batchCount; i++) {
-    int c = batchCodes[i];
-    bool isOk = (c >= 200 && c < 300);
-    bool isPermanentBad = (c >= 400 && c < 500 && c != 408 && c != 429);
-    if (!isOk && !isPermanentBad) {
-      tmpFile.println(batchLines[i]);
-    }
-  }
-
-  if (hasTail) {
-    File tailSrc = SD.open(QUEUE_FILE, FILE_READ);
-    if (tailSrc) {
-      tailSrc.seek(resumeOffset, SeekSet);
-      uint8_t buf[256];
-      while (tailSrc.available()) {
-        while (GPS.available() > 0) gps.encode(GPS.read());
-        size_t n = tailSrc.read(buf, sizeof(buf));
-        if (n == 0) break;
-        tmpFile.write(buf, n);
-      }
-      tailSrc.close();
-    }
-  }
-  tmpFile.flush();
-  tmpFile.close();
-
-  SD.remove(QUEUE_FILE);
-  SD.rename(QUEUE_TMP_FILE, QUEUE_FILE);
-  Serial.printf("📌 [Offline Queue] รอบนี้ส่งสำเร็จ %d, ย้ายคิวเสีย %d (ทยอยส่งที่เหลือต่อรอบถัดไป)\n",
-                sentCount, badCount);
-}
-
-#if ENABLE_FIREBASE_SYNC
-void initFirebaseIfReady() {
-  if (firebaseInitialized || WiFi.status() != WL_CONNECTED) return;
-
-  config.api_key = API_KEY;
-  config.database_url = DATABASE_URL;
-
-  if (Firebase.signUp(&config, &auth, "", "")) {
-    Serial.println("✔ Firebase SignUp Success");
   } else {
-    Serial.printf("✘ SignUp Failed: %s\n", config.signer.signupError.message.c_str());
-  }
-
-  config.token_status_callback = tokenStatusCallback;
-  Firebase.begin(&config, &auth);
-  Firebase.reconnectWiFi(true);
-  firebaseInitialized = true;
-}
-
-void sendToFirebase(double lat, double lng, double speedKmh, double acc, const DeviceDateTime& dt) {
-  if (!firebaseInitialized) initFirebaseIfReady();
-  if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
-    FirebaseJson json;
-    json.set("device_id", FIREBASE_DEVICE_ID);
-    json.set("lat", lat);
-    json.set("lng", lng);
-    json.set("speed", speedKmh);
-    json.set("accuracy", acc);
-    json.set("date", dt.dateTH);
-    json.set("time", dt.timeTH);
-    json.set("device_time", dt.isoTH);
-
-    String pathLog = "/gps_log/" + String(FIREBASE_DEVICE_ID);
-    if (Firebase.RTDB.pushJSON(&fbdo, pathLog, &json)) {
-      Serial.println("✔ Firebase Log saved");
-    } else {
-      Serial.println("✘ Firebase Log Error: " + fbdo.errorReason());
-    }
-
-    String pathLatest = "/gps_data/" + String(FIREBASE_DEVICE_ID);
-    if (Firebase.RTDB.setJSON(&fbdo, pathLatest, &json)) {
-      Serial.println("✔ Firebase Current updated");
-    } else {
-      Serial.println("✘ Firebase Data Error: " + fbdo.errorReason());
-    }
+    writeQueueOffset(newOffset);
+    Serial.printf("📌 [Offline Queue] รอบนี้ส่งสำเร็จ %d, คิวเสีย %d (เหลือ %lu bytes ส่งต่อรอบถัดไป)\n",
+                  sentCount, badCount, (unsigned long)(fileSize - newOffset));
   }
 }
-#endif
 
 #if SD_WEB_ENABLE
 // ============================================================================
@@ -1217,6 +1158,7 @@ void handleSdWebView() {
   if (!sdReady) { sdWebServer.send(503, "text/plain", "SD not ready"); return; }
   String path = sanitizeSdPath(sdWebServer.arg("path"));
   if (path.length() == 0 || path == "/") { sdWebServer.send(400, "text/plain", "Invalid path"); return; }
+  flushSDCsvBuffer(); // เขียนจุดที่ค้างใน RAM ลงการ์ดก่อน ให้ไฟล์ที่เปิดดู/ดาวน์โหลดเป็นข้อมูลล่าสุด
 
   File f = SD.open(path, FILE_READ);
   if (!f || f.isDirectory()) {
@@ -1263,6 +1205,7 @@ void handleSdWebDownload() {
   if (!sdReady) { sdWebServer.send(503, "text/plain", "SD not ready"); return; }
   String path = sanitizeSdPath(sdWebServer.arg("path"));
   if (path.length() == 0 || path == "/") { sdWebServer.send(400, "text/plain", "Invalid path"); return; }
+  flushSDCsvBuffer(); // เขียนจุดที่ค้างใน RAM ลงการ์ดก่อน ให้ไฟล์ที่เปิดดู/ดาวน์โหลดเป็นข้อมูลล่าสุด
 
   File f = SD.open(path, FILE_READ);
   if (!f || f.isDirectory()) {
@@ -1442,9 +1385,6 @@ void setup() {
     #if SD_WEB_ENABLE
       initSdWebServerIfReady();
     #endif
-    #if ENABLE_FIREBASE_SYNC
-      initFirebaseIfReady();
-    #endif
   } else {
     Serial.println("\n⚠️ ยังไม่พบ Wi-Fi ในรายการ — บันทึกลง SD Card และเข้าอ่านผ่าน Hotspot \"" SD_AP_SSID "\" ได้ทันที");
   }
@@ -1570,10 +1510,6 @@ void loop() {
 
         // บันทึก 5Hz ทุกจุดลง SD Card CSV ทันที
         appendCSVLog(dt, lat, lng, speedKmh, acc, sats, WiFi.status() == WL_CONNECTED);
-
-        #if ENABLE_FIREBASE_SYNC
-          sendToFirebase(lat, lng, speedKmh, acc, dt);
-        #endif
       }
     } else {
       printGpsSearchStatus(sats);
@@ -1593,8 +1529,10 @@ void loop() {
     flushCloudBatch();
   }
 
-  // 3. ทยอยส่งคิว Offline ที่ค้างบน SD Card เมื่อ Wi-Fi กลับมา
-  if (millis() - lastQueueSyncTime >= QUEUE_SYNC_MS) {
+  // 3. ทยอยส่งคิว Offline ที่ค้างบน SD Card เมื่อ Wi-Fi กลับมา (มีคิวค้าง = วนถี่ขึ้นเพื่อเคลียร์ให้ไว)
+  unsigned long queueInterval = (offlineQueuePending && WiFi.status() == WL_CONNECTED)
+                                  ? QUEUE_SYNC_FAST_MS : QUEUE_SYNC_MS;
+  if (millis() - lastQueueSyncTime >= queueInterval) {
     lastQueueSyncTime = millis();
     flushOfflineQueue();
   }
