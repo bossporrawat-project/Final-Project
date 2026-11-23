@@ -76,7 +76,7 @@ function computeStatsForPoints(
 
 const DEFAULT_SUPABASE_URL = 'https://ryuhkaytmlapkuumgnlo.supabase.co';
 const DEFAULT_SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ5dWhrYXl0bWxhcGt1dW1nbmxvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE1MzY4MjUsImV4cCI6MjEwNzExMjgyNX0.JYKrvAMK64xE5r92pepQy02fVl4mO55dMaz93heaee8';
-const DEFAULT_TRACCAR_TOKEN = 'RzBFAiBkOw7xmh0RLkFb2EJminVQH64C9WxDAkEQyrIZYCOMqgIhANeBkpHF-mJzhITZrDJlBKzotfISUWrMdci5NkIqKetneyJpIjozOTUzODc3MTE5MDYwMjUxMzA4LCJ1IjoxMDQ0NSwiZSI6IjIwMzgtMTItMjlUMTc6MDA6MDAuMDAwKzAwOjAwIn0';
+const DEFAULT_TRACCAR_TOKEN = 'SDBGAiEA7JbybnCRucezj3mEejwklEb6gAfl5SJkdxxpIEKeGj0CIQDe1zk0ASwL-Ztdc-9Q-IWM3LbMqrU6Ewtm79VukbWCHXsiaSI6MjUyODgwMDI3OTE5Mzk1MzAsInUiOjEwNDQ1LCJlIjoiMjAzNC0xMi0yOVQxNzowMDowMC4wMDArMDA6MDAifQ';
 const HISTORY_PAGE_SIZE = 50;
 const MAX_IN_MEMORY_ROUTE_POINTS = 12000;
 const MAX_CSV_EXPORT_ROWS = 100000;
@@ -201,15 +201,8 @@ export default function Dashboard() {
     const url = localStorage.getItem('omni_supa_url') || process.env.NEXT_PUBLIC_SUPABASE_URL || DEFAULT_SUPABASE_URL;
     const key = localStorage.getItem('omni_supa_key') || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || DEFAULT_SUPABASE_ANON_KEY;
     const name = localStorage.getItem('omni_device_name') || process.env.NEXT_PUBLIC_DEVICE_NAME || 'ESP32_Tracker';
-    const savedTrcToken = localStorage.getItem('omni_traccar_token');
-    const isLegacyToken =
-      savedTrcToken &&
-      (savedTrcToken.startsWith('SDBGAiEAtq5U') || savedTrcToken.startsWith('RzBFAiEA0r4vWkHt8kbO4UUd'));
-    const validSavedToken = savedTrcToken && !isLegacyToken ? savedTrcToken : null;
-    const token = validSavedToken || DEFAULT_TRACCAR_TOKEN;
-    if (!savedTrcToken || isLegacyToken) {
-      localStorage.setItem('omni_traccar_token', token);
-    }
+    const token = DEFAULT_TRACCAR_TOKEN;
+    localStorage.setItem('omni_traccar_token', token);
 
     setMyDevice(name || 'ESP32_Tracker');
     initializeSupabase(url, key);
