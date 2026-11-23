@@ -23,7 +23,9 @@
 #include <HardwareSerial.h>
 #include <TinyGPS++.h>
 #include <SPI.h>
+#include <FS.h>
 #include <SD.h>
+#include <LittleFS.h>
 #include <Preferences.h>
 #include <time.h>
 
@@ -89,7 +91,8 @@ TinyGPSCustom glGsvInView;
 Preferences prefs;
 
 bool sdReady = false;
-bool offlineQueuePending = false; // มีคิวค้างบน SD หรือไม่ (เก็บใน RAM ไม่ต้องถามการ์ดทุกรอบ loop)
+bool littleFsReady = false;       // Internal Flash (LittleFS) พร้อมทำงานเป็นตัวสำรองอัตโนมัติ
+bool offlineQueuePending = false; // มีคิวค้างบน SD / LittleFS หรือไม่ (เก็บใน RAM ไม่ต้องถามการ์ดทุกรอบ loop)
 bool m8nTimeAssisted = false;
 bool ev5HzActivated = false;
 bool ntpConfigured = false;
@@ -394,9 +397,25 @@ DeviceDateTime getDeviceDateTime() {
 }
 
 // ----------------------------------------------------------------------------
-// ฟังก์ชันเริ่มต้นใช้งาน SD Card (VSPI: CS=5, SCK=18, MISO=19, MOSI=23)
+// ระบบบันทึกข้อมูลแบบ Auto-Fallback: SD Card (หลัก) -> LittleFS Internal Flash (สำรองอัตโนมัติ)
 // ----------------------------------------------------------------------------
 static String lastVerifiedCsvPath = "";
+static bool   lastVerifiedOnSd    = false;
+const size_t  LITTLEFS_CSV_RESERVE_BYTES = 65536; // กันพื้นที่ 64KB สุดท้ายของ Internal Flash ไว้ให้ Offline Queue เสมอ
+
+static inline bool hasAnyStorage() {
+  return sdReady || littleFsReady;
+}
+
+static inline fs::FS& activeFS() {
+  return sdReady ? (fs::FS&)SD : (fs::FS&)LittleFS;
+}
+
+static inline const char* activeStorageLabel() {
+  if (sdReady) return "SD Card";
+  if (littleFsReady) return "Internal Flash (LittleFS)";
+  return "NONE";
+}
 
 bool mountSdOnce() {
   pinMode(SD_CS_PIN, OUTPUT);
@@ -417,66 +436,113 @@ bool mountSdOnce() {
 }
 
 bool recoverSDCard() {
-  if (millis() - lastSdRecoverTime < 5000) return sdReady;
+  // ถ้ามี LittleFS สำรองอยู่แล้ว ให้ลองกู้ SD Card ห่างขึ้น (ทุก 30 วิ) เพื่อไม่ให้กวนจังหวะ 5Hz
+  unsigned long retryInterval = littleFsReady ? 30000UL : 5000UL;
+  if (millis() - lastSdRecoverTime < retryInterval) return sdReady;
   lastSdRecoverTime = millis();
-  Serial.println("🔄 [SD Card] ตรวจพบการหลุด/เขียนไม่ผ่าน -> กำลังรีเซ็ตเชื่อมต่อใหม่อัตโนมัติ...");
+  Serial.println("🔄 [SD Card] กำลังลองเชื่อมต่อ SD Card ใหม่อัตโนมัติ...");
   SD.end();
+  SPI.end();
   lastVerifiedCsvPath = "";
-  delay(40);
+  delay(30);
   if (mountSdOnce()) {
-    Serial.println("✅ [SD Card] กู้คืนการเชื่อมต่อสำเร็จ!");
+    Serial.println("✅ [SD Card] กู้คืนการเชื่อมต่อสำเร็จ! สลับกลับมาเขียนลง SD Card เป็นหลัก");
     return true;
   }
-  Serial.println("⚠️ [SD Card] ยังกู้คืนไม่สำเร็จ (เช็กไฟ 5V VIN / ขา 5,18,19,23)");
+  if (littleFsReady) {
+    Serial.println("💾 [Auto-Fallback] ยังไม่พบ SD Card -> บันทึกลง Internal Flash (LittleFS) ในบอร์ดต่อเนื่อง");
+  } else {
+    Serial.println("⚠️ [SD Card] ยังกู้คืนไม่สำเร็จ (เช็กไฟ 5V VIN / ขา 5,18,19,23)");
+  }
   return false;
 }
 
-bool ensureCsvHeader(const String& csvPath) {
-  if (csvPath == lastVerifiedCsvPath) return true;
-  if (!SD.exists(csvPath)) {
-    File file = SD.open(csvPath, FILE_WRITE);
+bool ensureCsvHeaderOnFs(fs::FS& fs, bool isSd, const String& csvPath) {
+  if (csvPath == lastVerifiedCsvPath && isSd == lastVerifiedOnSd) return true;
+  if (!fs.exists(csvPath)) {
+    File file = fs.open(csvPath, FILE_WRITE);
     if (!file) return false;
     size_t w = file.println("device_id,recorded_date,recorded_time,device_time_iso,latitude,longitude,speed_kmh,accuracy_m,satellites,synced_supabase");
     file.close();
     if (w == 0) return false;
-    Serial.printf("📄 [SD Card] สร้างไฟล์ %s เรียบร้อย\n", csvPath.c_str());
+    Serial.printf("📄 [%s] สร้างไฟล์ %s เรียบร้อย\n", isSd ? "SD Card" : "LittleFS", csvPath.c_str());
   }
   lastVerifiedCsvPath = csvPath;
+  lastVerifiedOnSd = isSd;
   return true;
 }
 
 void initSDCard() {
-  if (!mountSdOnce()) {
-    Serial.println("⚠️ [SD Card] ไม่พบโมดูล SD Card หรือการ์ดยังไม่ได้เสียบ");
-    Serial.println("   เช็กสาย 6 เส้น: VCC->VIN(5V) | GND->GND | CS->5 | SCK->18 | MISO->19 | MOSI->23");
-    return;
+  // 1. เปิดใช้งาน LittleFS (Internal Flash ในตัวบอร์ด ESP32) เตรียมไว้เป็นตัวสำรองเสมอ
+  if (LittleFS.begin(true)) {
+    littleFsReady = true;
+    Serial.printf("💾 [LittleFS] ระบบไฟล์สำรองในชิป ESP32 พร้อมใช้งาน (ขนาด: %llu KB | ใช้ไป: %llu KB)\n",
+                  (unsigned long long)(LittleFS.totalBytes() / 1024ULL),
+                  (unsigned long long)(LittleFS.usedBytes() / 1024ULL));
+  } else {
+    littleFsReady = false;
+    Serial.println("⚠️ [LittleFS] ไม่สามารถเปิดระบบไฟล์ในชิป ESP32 ได้");
   }
-  Serial.println("✅ [SD Card] เชื่อมต่อสำเร็จ (SPI Stable Mode)!");
-  Serial.printf("   ประเภท: %s | ขนาดการ์ด: %llu MB | ใช้ไป: %llu MB\n",
-                SD.cardType() == CARD_SDHC ? "SDHC/SDXC" : (SD.cardType() == CARD_SD ? "SDSC" : "MMC/อื่นๆ"),
-                SD.cardSize() / (1024ULL * 1024ULL), SD.usedBytes() / (1024ULL * 1024ULL));
-  offlineQueuePending = SD.exists(QUEUE_FILE);
+
+  // 2. ลองเชื่อมต่อโมดูล SD Card ภายนอก
+  lastSdRecoverTime = millis();
+  if (!mountSdOnce()) {
+    Serial.println("⚠️ [SD Card] ไม่พบโมดูล SD Card หรือการ์ดยังไม่ได้เสียบ (VCC->VIN 5V | CS->5 | SCK->18 | MISO->19 | MOSI->23)");
+    if (littleFsReady) {
+      Serial.println("✅ [Auto-Fallback] สลับมาบันทึกลง Internal Flash (LittleFS) ในตัวบอร์ดอัตโนมัติ (เข้าดูผ่าน /boss-sd ได้ทันที)");
+    }
+  } else {
+    Serial.println("✅ [SD Card] เชื่อมต่อสำเร็จ (SPI Stable Mode)!");
+    Serial.printf("   ประเภท: %s | ขนาดการ์ด: %llu MB | ใช้ไป: %llu MB\n",
+                  SD.cardType() == CARD_SDHC ? "SDHC/SDXC" : (SD.cardType() == CARD_SD ? "SDSC" : "MMC/อื่นๆ"),
+                  SD.cardSize() / (1024ULL * 1024ULL), SD.usedBytes() / (1024ULL * 1024ULL));
+  }
+
+  offlineQueuePending = (sdReady && SD.exists(QUEUE_FILE)) || (littleFsReady && LittleFS.exists(QUEUE_FILE));
   if (offlineQueuePending) {
     Serial.println("📦 [Offline Queue] พบคิวค้างจากรอบก่อน จะทยอยส่งเมื่อเชื่อม Wi-Fi ได้");
   }
 }
 
-bool writeSdCsvChunk(const String& path, const String& payload) {
-  if (!ensureCsvHeader(path)) { sdReady = false; return false; }
-  File file = SD.open(path, FILE_APPEND);
-  if (!file) { sdReady = false; return false; }
+static bool writeCsvToFs(fs::FS& fs, bool isSd, const String& path, const String& payload) {
+  if (!isSd) {
+    size_t totalB = LittleFS.totalBytes();
+    size_t usedB  = LittleFS.usedBytes();
+    if (totalB > usedB && (totalB - usedB) < (payload.length() + LITTLEFS_CSV_RESERVE_BYTES)) {
+      return false; // กันพื้นที่ 64KB สุดท้ายของ LittleFS ไว้ให้ Offline Queue
+    }
+  }
+  if (!ensureCsvHeaderOnFs(fs, isSd, path)) return false;
+  File file = fs.open(path, FILE_APPEND);
+  if (!file) return false;
   size_t w = file.print(payload);
   file.flush();
   file.close();
-  if (w != payload.length()) { sdReady = false; return false; }
-  return true;
+  return w == payload.length();
+}
+
+bool writeSdCsvChunk(const String& path, const String& payload) {
+  if (sdReady) {
+    if (writeCsvToFs(SD, true, path, payload)) return true;
+    sdReady = false;
+    lastVerifiedCsvPath = "";
+  }
+  if (recoverSDCard()) {
+    if (writeCsvToFs(SD, true, path, payload)) return true;
+    sdReady = false;
+    lastVerifiedCsvPath = "";
+  }
+  if (littleFsReady) {
+    return writeCsvToFs(LittleFS, false, path, payload);
+  }
+  return false;
 }
 
 void flushSDCsvBuffer() {
   lastSdFlushTime = millis();
   if (sdCsvBufferedCount == 0 || sdCsvBuffer.length() == 0) return;
 
-  if (!sdReady && !recoverSDCard()) {
+  if (!hasAnyStorage() && !recoverSDCard()) {
     if (sdCsvBuffer.length() > 8192) {
       sdCsvBuffer = "";
       sdCsvBufferedCount = 0;
@@ -484,21 +550,16 @@ void flushSDCsvBuffer() {
     return;
   }
 
-  if (!writeSdCsvChunk(sdCsvTargetPath, sdCsvBuffer)) {
-    if (recoverSDCard() && writeSdCsvChunk(sdCsvTargetPath, sdCsvBuffer)) {
-      sdCsvBuffer = "";
-      sdCsvBufferedCount = 0;
-      return;
-    }
-    if (sdCsvBuffer.length() > 8192) {
-      sdCsvBuffer = "";
-      sdCsvBufferedCount = 0;
-    }
+  if (writeSdCsvChunk(sdCsvTargetPath, sdCsvBuffer)) {
+    sdCsvBuffer = "";
+    sdCsvBufferedCount = 0;
     return;
   }
 
-  sdCsvBuffer = "";
-  sdCsvBufferedCount = 0;
+  if (sdCsvBuffer.length() > 8192) {
+    sdCsvBuffer = "";
+    sdCsvBufferedCount = 0;
+  }
 }
 
 void appendCSVLog(const DeviceDateTime& dt, double lat, double lng, double speedKmh, double acc, int sats, bool synced) {
@@ -531,23 +592,44 @@ void appendCSVLog(const DeviceDateTime& dt, double lat, double lng, double speed
 }
 
 void enqueueOfflinePayload(const String& jsonPayload) {
-  if (!sdReady && !recoverSDCard()) return;
-  File file = SD.open(QUEUE_FILE, FILE_APPEND);
-  if (!file) {
+  if (!sdReady) recoverSDCard();
+
+  if (sdReady) {
+    File file = SD.open(QUEUE_FILE, FILE_APPEND);
+    if (file) {
+      size_t w = file.println(jsonPayload);
+      file.flush();
+      file.close();
+      if (w > 0) {
+        offlineQueuePending = true;
+        Serial.println("📦 [Offline Queue] พักข้อมูลลง SD Card รอส่งย้อนหลัง");
+        return;
+      }
+    }
     sdReady = false;
-    if (recoverSDCard()) file = SD.open(QUEUE_FILE, FILE_APPEND);
+    lastVerifiedCsvPath = "";
   }
-  if (file) {
-    size_t w = file.println(jsonPayload);
-    file.flush();
-    file.close();
-    if (w > 0) {
-      offlineQueuePending = true;
-      Serial.println("📦 [Offline Queue] พักข้อมูลลง SD Card รอส่งย้อนหลัง");
+
+  if (littleFsReady) {
+    size_t totalB = LittleFS.totalBytes();
+    size_t usedB  = LittleFS.usedBytes();
+    if (totalB <= usedB || (totalB - usedB) < (jsonPayload.length() + 2048)) {
+      Serial.println("⚠️ [LittleFS] พื้นที่ Internal Flash เต็ม ไม่สามารถเพิ่มคิว Offline ได้");
       return;
     }
+    File file = LittleFS.open(QUEUE_FILE, FILE_APPEND);
+    if (file) {
+      size_t w = file.println(jsonPayload);
+      file.flush();
+      file.close();
+      if (w > 0) {
+        offlineQueuePending = true;
+        Serial.println("📦 [Offline Queue -> LittleFS] พักข้อมูลลง Internal Flash รอส่งย้อนหลัง");
+        return;
+      }
+    }
   }
-  Serial.println("⚠️ [SD Card] เขียน Offline Queue ไม่สำเร็จ");
+  Serial.println("⚠️ [Storage] เขียน Offline Queue ไม่สำเร็จ");
 }
 
 // ----------------------------------------------------------------------------
@@ -624,9 +706,9 @@ bool sendToSupabase(const String& jsonPayload) {
 // - ส่งตามลำดับเวลา: ถ้าบรรทัดไหนติดปัญหาเน็ต จะหยุดรอบนั้นแล้วลองบรรทัดเดิมใหม่รอบหน้า
 // - เมื่อส่งครบทั้งไฟล์ จะลบไฟล์คิว + ไฟล์ตำแหน่งทิ้ง
 // ----------------------------------------------------------------------------
-static size_t readQueueOffset() {
-  if (!SD.exists(QUEUE_POS_FILE)) return 0;
-  File p = SD.open(QUEUE_POS_FILE, FILE_READ);
+static size_t readQueueOffset(fs::FS& fs) {
+  if (!fs.exists(QUEUE_POS_FILE)) return 0;
+  File p = fs.open(QUEUE_POS_FILE, FILE_READ);
   if (!p) return 0;
   String s = p.readStringUntil('\n');
   p.close();
@@ -635,40 +717,38 @@ static size_t readQueueOffset() {
   return v > 0 ? (size_t)v : 0;
 }
 
-static void writeQueueOffset(size_t offset) {
-  File p = SD.open(QUEUE_POS_FILE, FILE_WRITE); // FILE_WRITE = เขียนทับไฟล์ใหม่
+static void writeQueueOffset(fs::FS& fs, size_t offset) {
+  File p = fs.open(QUEUE_POS_FILE, FILE_WRITE); // FILE_WRITE = เขียนทับไฟล์ใหม่
   if (!p) return;
   p.println((unsigned long)offset);
   p.close();
 }
 
-static void clearOfflineQueueFiles() {
-  SD.remove(QUEUE_FILE);
-  SD.remove(QUEUE_POS_FILE);
-  offlineQueuePending = false;
+static void clearOfflineQueueFiles(fs::FS& fs) {
+  fs.remove(QUEUE_FILE);
+  fs.remove(QUEUE_POS_FILE);
 }
 
-void flushOfflineQueue() {
-  if ((!sdReady && !recoverSDCard()) || WiFi.status() != WL_CONNECTED) return;
-  if (!SD.exists(QUEUE_FILE)) {
-    if (SD.exists(QUEUE_POS_FILE)) SD.remove(QUEUE_POS_FILE);
-    offlineQueuePending = false;
+static void flushOfflineQueueOnFs(fs::FS& fs, bool isSd, const char* storageLabel) {
+  if (!fs.exists(QUEUE_FILE)) {
+    if (fs.exists(QUEUE_POS_FILE)) fs.remove(QUEUE_POS_FILE);
     return;
   }
-  offlineQueuePending = true;
 
-  File qFile = SD.open(QUEUE_FILE, FILE_READ);
+  File qFile = fs.open(QUEUE_FILE, FILE_READ);
   if (!qFile) {
-    sdReady = false;
-    recoverSDCard();
+    if (isSd) {
+      sdReady = false;
+      recoverSDCard();
+    }
     return;
   }
 
   size_t fileSize = qFile.size();
-  size_t offset = readQueueOffset();
+  size_t offset = readQueueOffset(fs);
   if (fileSize == 0 || offset >= fileSize) {
     qFile.close();
-    clearOfflineQueueFiles();
+    clearOfflineQueueFiles(fs);
     return;
   }
 
@@ -692,13 +772,13 @@ void flushOfflineQueue() {
   qFile.close();
 
   if (batchCount == 0) {
-    if (offset >= fileSize) clearOfflineQueueFiles();
-    else writeQueueOffset(offset);
+    if (offset >= fileSize) clearOfflineQueueFiles(fs);
+    else writeQueueOffset(fs, offset);
     return;
   }
 
-  Serial.printf("🔄 [Offline Queue] พบข้อมูลค้างใน SD Card (%lu/%lu bytes) กำลังทยอยส่งขึ้น Supabase...\n",
-                (unsigned long)offset, (unsigned long)fileSize);
+  Serial.printf("🔄 [Offline Queue - %s] พบข้อมูลค้าง (%lu/%lu bytes) กำลังทยอยส่งขึ้น Supabase...\n",
+                storageLabel, (unsigned long)offset, (unsigned long)fileSize);
   int sentCount = 0;
   int badCount = 0;
   size_t newOffset = offset;
@@ -712,8 +792,7 @@ void flushOfflineQueue() {
       sentCount++;
       newOffset = lineEndOffsets[i];
     } else if (code >= 400 && code < 500 && code != 408 && code != 429) {
-      // ข้อมูลเสียถาวร (เช่น JSON ผิดรูป) -> ย้ายไปเก็บไว้ดูทีหลัง แล้วข้ามไป
-      File badFile = SD.open(QUEUE_BAD_FILE, FILE_APPEND);
+      File badFile = fs.open(QUEUE_BAD_FILE, FILE_APPEND);
       if (badFile) {
         badFile.println(batchLines[i]);
         badFile.close();
@@ -721,22 +800,35 @@ void flushOfflineQueue() {
       badCount++;
       newOffset = lineEndOffsets[i];
     } else {
-      // เน็ต/เซิร์ฟเวอร์มีปัญหาชั่วคราว -> หยุดรอบนี้ไว้ก่อน รักษาลำดับเวลา
       break;
     }
   }
 
-  if (newOffset == offset) return; // ไม่มีอะไรคืบหน้า ไม่ต้องเขียนการ์ด
+  if (newOffset == offset) return;
 
   if (newOffset >= fileSize) {
-    clearOfflineQueueFiles();
-    Serial.printf("🎉 [Offline Queue] เคลียร์คิวบน SD Card เรียบร้อย (สำเร็จ %d, คิวเสีย %d)\n",
-                  sentCount, badCount);
+    clearOfflineQueueFiles(fs);
+    Serial.printf("🎉 [Offline Queue - %s] เคลียร์คิวเรียบร้อย (สำเร็จ %d, คิวเสีย %d)\n",
+                  storageLabel, sentCount, badCount);
   } else {
-    writeQueueOffset(newOffset);
-    Serial.printf("📌 [Offline Queue] รอบนี้ส่งสำเร็จ %d, คิวเสีย %d (เหลือ %lu bytes ส่งต่อรอบถัดไป)\n",
-                  sentCount, badCount, (unsigned long)(fileSize - newOffset));
+    writeQueueOffset(fs, newOffset);
+    Serial.printf("📌 [Offline Queue - %s] รอบนี้ส่งสำเร็จ %d, คิวเสีย %d (เหลือ %lu bytes ส่งต่อรอบถัดไป)\n",
+                  storageLabel, sentCount, badCount, (unsigned long)(fileSize - newOffset));
   }
+}
+
+void flushOfflineQueue() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (!sdReady) recoverSDCard();
+
+  if (littleFsReady && LittleFS.exists(QUEUE_FILE)) {
+    flushOfflineQueueOnFs(LittleFS, false, "LittleFS");
+  }
+  if (sdReady && SD.exists(QUEUE_FILE)) {
+    flushOfflineQueueOnFs(SD, true, "SD Card");
+  }
+
+  offlineQueuePending = (sdReady && SD.exists(QUEUE_FILE)) || (littleFsReady && LittleFS.exists(QUEUE_FILE));
 }
 
 #if SD_WEB_ENABLE
@@ -1066,9 +1158,9 @@ static void appendJsonEscaped(String& out, const String& s) {
   }
 }
 
-static void appendSdTreeJson(const String& dirPath, String& out, bool& firstItem, int depth, int& count) {
+static void appendSdTreeJson(fs::FS& fs, const String& dirPath, String& out, bool& firstItem, int depth, int& count) {
   if (depth > 4 || count >= 250) return;
-  File dir = SD.open(dirPath);
+  File dir = fs.open(dirPath);
   if (!dir || !dir.isDirectory()) {
     if (dir) dir.close();
     return;
@@ -1099,7 +1191,7 @@ static void appendSdTreeJson(const String& dirPath, String& out, bool& firstItem
     count++;
 
     if (isDir) {
-      appendSdTreeJson(entryPath, out, firstItem, depth + 1, count);
+      appendSdTreeJson(fs, entryPath, out, firstItem, depth + 1, count);
     }
     entry = dir.openNextFile();
   }
@@ -1107,12 +1199,25 @@ static void appendSdTreeJson(const String& dirPath, String& out, bool& firstItem
 }
 
 static const char* sdCardTypeLabel() {
-  if (!sdReady) return "NONE";
-  sdcard_type_t t = SD.cardType();
-  if (t == CARD_MMC)  return "MMC";
-  if (t == CARD_SD)   return "SDSC";
-  if (t == CARD_SDHC) return "SDHC";
-  return "UNKNOWN";
+  if (sdReady) {
+    sdcard_type_t t = SD.cardType();
+    if (t == CARD_MMC)  return "MMC";
+    if (t == CARD_SD)   return "SDSC";
+    if (t == CARD_SDHC) return "SDHC";
+    return "SD_CARD";
+  }
+  if (littleFsReady) return "INTERNAL_FLASH (LittleFS)";
+  return "NONE";
+}
+
+static File openStorageFileForRead(const String& path) {
+  if (sdReady && SD.exists(path)) {
+    return SD.open(path, FILE_READ);
+  }
+  if (littleFsReady && LittleFS.exists(path)) {
+    return LittleFS.open(path, FILE_READ);
+  }
+  return File();
 }
 
 void handleSdWebRoot() {
@@ -1121,11 +1226,19 @@ void handleSdWebRoot() {
 
 void handleSdWebInfo() {
   if (!sdReady) recoverSDCard();
+  bool anyReady = hasAnyStorage();
+  unsigned long long totalB = sdReady
+    ? (unsigned long long)SD.totalBytes()
+    : (littleFsReady ? (unsigned long long)LittleFS.totalBytes() : 0ULL);
+  unsigned long long usedB = sdReady
+    ? (unsigned long long)SD.usedBytes()
+    : (littleFsReady ? (unsigned long long)LittleFS.usedBytes() : 0ULL);
+
   String json = "{";
-  json += "\"sdReady\":" + String(sdReady ? "true" : "false") + ",";
+  json += "\"sdReady\":" + String(anyReady ? "true" : "false") + ",";
   json += "\"cardType\":\"" + String(sdCardTypeLabel()) + "\",";
-  json += "\"totalBytes\":" + String(sdReady ? (unsigned long long)SD.totalBytes() : 0ULL) + ",";
-  json += "\"usedBytes\":" + String(sdReady ? (unsigned long long)SD.usedBytes() : 0ULL) + ",";
+  json += "\"totalBytes\":" + String(totalB) + ",";
+  json += "\"usedBytes\":" + String(usedB) + ",";
   json += "\"gpsValid\":" + String((gps.location.isValid() && gps.location.age() < 3000) ? "true" : "false") + ",";
   json += "\"lat\":" + String(gps.location.isValid() ? gps.location.lat() : 0.0, 6) + ",";
   json += "\"lng\":" + String(gps.location.isValid() ? gps.location.lng() : 0.0, 6) + ",";
@@ -1141,7 +1254,7 @@ void handleSdWebInfo() {
 }
 
 void handleSdWebList() {
-  if (!sdReady && !recoverSDCard()) {
+  if (!hasAnyStorage() && !recoverSDCard()) {
     sdWebServer.send(503, "application/json; charset=utf-8", "{\"ok\":false,\"files\":[]}");
     return;
   }
@@ -1149,18 +1262,23 @@ void handleSdWebList() {
   String json = "{\"ok\":true,\"files\":[";
   bool firstItem = true;
   int count = 0;
-  appendSdTreeJson("/", json, firstItem, 0, count);
+  if (sdReady) {
+    appendSdTreeJson(SD, "/", json, firstItem, 0, count);
+  }
+  if (littleFsReady && (!sdReady || count == 0)) {
+    appendSdTreeJson(LittleFS, "/", json, firstItem, 0, count);
+  }
   json += "]}";
   sdWebServer.send(200, "application/json; charset=utf-8", json);
 }
 
 void handleSdWebView() {
-  if (!sdReady) { sdWebServer.send(503, "text/plain", "SD not ready"); return; }
+  if (!hasAnyStorage()) { sdWebServer.send(503, "text/plain", "Storage not ready"); return; }
   String path = sanitizeSdPath(sdWebServer.arg("path"));
   if (path.length() == 0 || path == "/") { sdWebServer.send(400, "text/plain", "Invalid path"); return; }
-  flushSDCsvBuffer(); // เขียนจุดที่ค้างใน RAM ลงการ์ดก่อน ให้ไฟล์ที่เปิดดู/ดาวน์โหลดเป็นข้อมูลล่าสุด
+  flushSDCsvBuffer(); // เขียนจุดที่ค้างใน RAM ลงหน่วยความจำก่อน ให้ไฟล์ที่เปิดดู/ดาวน์โหลดเป็นข้อมูลล่าสุด
 
-  File f = SD.open(path, FILE_READ);
+  File f = openStorageFileForRead(path);
   if (!f || f.isDirectory()) {
     if (f) f.close();
     sdWebServer.send(404, "text/plain", "File not found");
@@ -1202,12 +1320,12 @@ void handleSdWebView() {
 }
 
 void handleSdWebDownload() {
-  if (!sdReady) { sdWebServer.send(503, "text/plain", "SD not ready"); return; }
+  if (!hasAnyStorage()) { sdWebServer.send(503, "text/plain", "Storage not ready"); return; }
   String path = sanitizeSdPath(sdWebServer.arg("path"));
   if (path.length() == 0 || path == "/") { sdWebServer.send(400, "text/plain", "Invalid path"); return; }
-  flushSDCsvBuffer(); // เขียนจุดที่ค้างใน RAM ลงการ์ดก่อน ให้ไฟล์ที่เปิดดู/ดาวน์โหลดเป็นข้อมูลล่าสุด
+  flushSDCsvBuffer(); // เขียนจุดที่ค้างใน RAM ลงหน่วยความจำก่อน ให้ไฟล์ที่เปิดดู/ดาวน์โหลดเป็นข้อมูลล่าสุด
 
-  File f = SD.open(path, FILE_READ);
+  File f = openStorageFileForRead(path);
   if (!f || f.isDirectory()) {
     if (f) f.close();
     sdWebServer.send(404, "text/plain", "File not found");
@@ -1222,12 +1340,17 @@ void handleSdWebDownload() {
 }
 
 void handleSdWebDelete() {
-  if (!sdReady) { sdWebServer.send(503, "text/plain", "SD not ready"); return; }
+  if (!hasAnyStorage()) { sdWebServer.send(503, "text/plain", "Storage not ready"); return; }
   String path = sanitizeSdPath(sdWebServer.arg("path"));
   if (path.length() == 0 || path == "/") { sdWebServer.send(400, "text/plain", "Invalid path"); return; }
-  if (!SD.exists(path)) { sdWebServer.send(404, "text/plain", "Not found"); return; }
+  bool existed = (sdReady && SD.exists(path)) || (littleFsReady && LittleFS.exists(path));
+  if (!existed) { sdWebServer.send(404, "text/plain", "Not found"); return; }
 
-  if (SD.remove(path)) {
+  bool removed = false;
+  if (sdReady && SD.exists(path)) removed = SD.remove(path) || removed;
+  if (littleFsReady && LittleFS.exists(path)) removed = LittleFS.remove(path) || removed;
+
+  if (removed) {
     sdWebServer.send(200, "application/json", "{\"ok\":true}");
   } else {
     sdWebServer.send(500, "application/json", "{\"ok\":false}");
@@ -1431,17 +1554,17 @@ void loop() {
     }
   #endif
 
-  // ปล่อยให้ AutoReconnect ของ ESP32 ทำงานเบื้องหลัง และสลับ Wi-Fi ในรายการเมื่อล้มเหลว
+  // ปล่อยให้ AutoReconnect ของ ESP32 ทำงานเบื้องหลัง และสลับ Wi-Fi ในรายการเมื่อยังเกาะไม่ติด
   if (WiFi.status() != WL_CONNECTED) {
     if (!staPausedForAp && millis() - lastWifiRetryTime >= 20000) {
       lastWifiRetryTime = millis();
       wl_status_t st = WiFi.status();
-      if (st == WL_CONNECT_FAILED || st == WL_STOPPED || st == WL_NO_SSID_AVAIL) {
-        activeWifiIdx = (activeWifiIdx + 1) % WIFI_LIST_COUNT;
-        WiFi.begin(WIFI_LIST[activeWifiIdx].ssid, WIFI_LIST[activeWifiIdx].pass);
-      }
-      Serial.printf("📡 [WiFi] รอเชื่อม \"%s\" (2.4GHz, status=%d) — บันทึกลง SD Card ต่อเนื่อง\n",
-                    WIFI_LIST[activeWifiIdx].ssid, (int)st);
+      activeWifiIdx = (activeWifiIdx + 1) % WIFI_LIST_COUNT;
+      WiFi.disconnect(false, false);
+      delay(20);
+      WiFi.begin(WIFI_LIST[activeWifiIdx].ssid, WIFI_LIST[activeWifiIdx].pass);
+      Serial.printf("📡 [WiFi] สลับลองเชื่อม \"%s\" (2.4GHz, prev_status=%d) — บันทึกลง %s ต่อเนื่อง\n",
+                    WIFI_LIST[activeWifiIdx].ssid, (int)st, activeStorageLabel());
     }
   } else {
     if (!ntpConfigured) {
