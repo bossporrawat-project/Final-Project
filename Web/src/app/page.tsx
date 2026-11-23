@@ -76,7 +76,7 @@ function computeStatsForPoints(
 
 const DEFAULT_SUPABASE_URL = 'https://ryuhkaytmlapkuumgnlo.supabase.co';
 const DEFAULT_SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJ5dWhrYXl0bWxhcGt1dW1nbmxvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE1MzY4MjUsImV4cCI6MjEwNzExMjgyNX0.JYKrvAMK64xE5r92pepQy02fVl4mO55dMaz93heaee8';
-const DEFAULT_TRACCAR_TOKEN = 'RzBFAiEA0r4vWkHt8kbO4UUdUzpnQtp9kt8u-tCZpnGyuiOYnSMCIDdBykoJyep_WQyh3vNAFGJZz9anp4tVp3sJi6vi3mq3eyJpIjo3Mjg1Mzk1MjE3NTUyMDI5NTYxLCJ1IjoxNDg3MTYsImUiOiIyMDMwLTAxLTAxVDAwOjAwOjAwLjAwMCswMDowMCJ9';
+const DEFAULT_TRACCAR_TOKEN = 'RzBFAiBkOw7xmh0RLkFb2EJminVQH64C9WxDAkEQyrIZYCOMqgIhANeBkpHF-mJzhITZrDJlBKzotfISUWrMdci5NkIqKetneyJpIjozOTUzODc3MTE5MDYwMjUxMzA4LCJ1IjoxMDQ0NSwiZSI6IjIwMzgtMTItMjlUMTc6MDA6MDAuMDAwKzAwOjAwIn0';
 const HISTORY_PAGE_SIZE = 50;
 const MAX_IN_MEMORY_ROUTE_POINTS = 12000;
 const MAX_CSV_EXPORT_ROWS = 100000;
@@ -202,9 +202,12 @@ export default function Dashboard() {
     const key = localStorage.getItem('omni_supa_key') || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || DEFAULT_SUPABASE_ANON_KEY;
     const name = localStorage.getItem('omni_device_name') || process.env.NEXT_PUBLIC_DEVICE_NAME || 'ESP32_Tracker';
     const savedTrcToken = localStorage.getItem('omni_traccar_token');
-    const validSavedToken = savedTrcToken && !savedTrcToken.startsWith('SDBGAiEAtq5U') ? savedTrcToken : null;
-    const token = validSavedToken || process.env.NEXT_PUBLIC_TRACCAR_TOKEN || DEFAULT_TRACCAR_TOKEN;
-    if (savedTrcToken && savedTrcToken.startsWith('SDBGAiEAtq5U')) {
+    const isLegacyToken =
+      savedTrcToken &&
+      (savedTrcToken.startsWith('SDBGAiEAtq5U') || savedTrcToken.startsWith('RzBFAiEA0r4vWkHt8kbO4UUd'));
+    const validSavedToken = savedTrcToken && !isLegacyToken ? savedTrcToken : null;
+    const token = validSavedToken || DEFAULT_TRACCAR_TOKEN;
+    if (!savedTrcToken || isLegacyToken) {
       localStorage.setItem('omni_traccar_token', token);
     }
 

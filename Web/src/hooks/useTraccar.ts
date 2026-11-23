@@ -19,7 +19,7 @@ export function useTraccar(initialToken?: string | null) {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  const connect = useCallback(async (traccarToken: string, serverHost: string = 'demo.traccar.org') => {
+  const connect = useCallback(async (traccarToken: string, serverHost: string = 'demo3.traccar.org') => {
     if (wsRef.current) {
       if (wsRef.current.onclose) wsRef.current.onclose = null;
       wsRef.current.close();
@@ -32,35 +32,58 @@ export function useTraccar(initialToken?: string | null) {
     const cleanToken = traccarToken.trim();
     if (!cleanToken) return;
 
-    const cleanHost = serverHost.replace(/^https?:\/\//, '').replace(/^wss?:\/\//, '').replace(/\/+$/, '');
+    const requestedHost = serverHost.replace(/^https?:\/\//, '').replace(/^wss?:\/\//, '').replace(/\/+$/, '');
+    const candidateHosts = Array.from(new Set([
+      requestedHost,
+      'demo3.traccar.org',
+      'demo.traccar.org',
+      'demo2.traccar.org',
+      'demo4.traccar.org',
+    ]));
+
     setError(null);
 
-    // 1. Fetch initial latest positions via REST API & verify token validity
-    try {
-      const posRes = await fetch(`https://${cleanHost}/api/positions`, {
-        headers: {
-          'Authorization': `Bearer ${cleanToken}`,
-          'Accept': 'application/json'
-        }
-      });
+    // 1. Auto-detect which Traccar server accepts this token & fetch initial latest positions
+    let resolvedHost = requestedHost;
+    let authorized = false;
+    let sawUnauthorized = false;
 
-      if (posRes.status === 401 || posRes.status === 403) {
-        setIsConnected(false);
-        setError('Traccar Token หมดอายุหรือไม่ถูกต้อง (401 Unauthorized)');
-        console.warn('Traccar token unauthorized (401). Please generate a new token from Traccar.');
-        return;
-      }
+    for (const host of candidateHosts) {
+      try {
+        const posRes = await fetch(`https://${host}/api/positions`, {
+          headers: {
+            'Authorization': `Bearer ${cleanToken}`,
+            'Accept': 'application/json'
+          }
+        });
 
-      if (posRes.ok) {
-        const initialPositions = await posRes.json();
-        if (Array.isArray(initialPositions) && initialPositions.length > 0) {
-          setPositions(initialPositions);
+        if (posRes.status === 401 || posRes.status === 403) {
+          sawUnauthorized = true;
+          continue;
         }
+
+        if (posRes.ok) {
+          resolvedHost = host;
+          authorized = true;
+          const initialPositions = await posRes.json();
+          if (Array.isArray(initialPositions) && initialPositions.length > 0) {
+            setPositions(initialPositions);
+          }
+          break;
+        }
+      } catch (restErr) {
+        console.warn(`Traccar REST check warning on ${host}:`, restErr);
       }
-    } catch (restErr) {
-      // Fallback to WebSocket even if REST check fails due to CORS
-      console.warn('Traccar REST check warning:', restErr);
     }
+
+    if (!authorized && sawUnauthorized) {
+      setIsConnected(false);
+      setError('Traccar Token หมดอายุหรือไม่ถูกต้อง (401 Unauthorized)');
+      console.warn('Traccar token unauthorized (401) across candidate servers.');
+      return;
+    }
+
+    const cleanHost = resolvedHost;
 
     // 2. Connect WebSocket for real-time stream
     try {
